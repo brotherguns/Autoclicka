@@ -65,12 +65,6 @@ static void AC_EnqueueHIDEvent(IOHIDEventRef evt) {
     [inv invoke];
 }
 
-static void AC_InvokeVoid(id obj, SEL sel) {
-    NSMethodSignature *sig = [obj methodSignatureForSelector:sel];
-    if (!sig) return;
-    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-    inv.target = obj; inv.selector = sel; [inv invoke];
-}
 
 // Sender ID observed in real touch events on iOS 7+
 #define AC_SENDER_ID 0x8000000817319375ULL
