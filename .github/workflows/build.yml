@@ -1,0 +1,52 @@
+name: Build UniversalAutoClicker
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  THEOS: ${{ github.workspace }}/theos
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Theos
+        id: cache-theos
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.THEOS }}
+          key: theos-${{ runner.os }}-v1
+
+      - name: Install Theos
+        if: steps.cache-theos.outputs.cache-hit != 'true'
+        run: |
+          brew install ldid xz
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+
+      - name: Download iOS SDK
+        if: steps.cache-theos.outputs.cache-hit != 'true'
+        run: |
+          if [ ! -d "$THEOS/sdks/iPhoneOS16.5.sdk" ]; then
+            curl -L \
+              "https://github.com/xybp888/iOS-SDKs/releases/download/download/iPhoneOS16.5.sdk.zip" \
+              -o sdk.zip
+            unzip -q sdk.zip -d $THEOS/sdks/
+            rm sdk.zip
+          fi
+
+      - name: Build
+        run: |
+          make package FINALPACKAGE=1 STRIP=0
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: UniversalAutoClicker-deb
+          path: packages/*.deb
+          if-no-files-found: error
