@@ -7,65 +7,131 @@
 #import <objc/runtime.h>
 
 // ============================================================
-// MARK: - Private Headers (KIF-style, matches reference dylib)
-// ============================================================
-
-@interface UITouch (ACPrivate)
-- (instancetype)initAtPoint:(CGPoint)point inWindow:(UIWindow *)window;
-- (void)_setLocationInWindow:(CGPoint)location resetPrevious:(BOOL)reset;
-- (void)_setWindow:(UIWindow *)window;
-- (void)_setPhase:(UITouchPhase)phase;
-- (void)_setTimestamp:(NSTimeInterval)ts;
-- (void)_setView:(UIView *)view;
-- (void)_setTapCount:(NSUInteger)count;
-@end
-
-@interface UIEvent (ACPrivate)
-- (void)_clearTouches;
-- (void)_addTouch:(UITouch *)touch forDelayedDelivery:(BOOL)delayed;
-@end
-
-@interface UIApplication (ACPrivate)
-- (UIEvent *)_touchesEvent;
-@end
-
-// ============================================================
 // MARK: - Touch Injection
 // ============================================================
 
 static void AC_Inject(CGPoint point) {
-    UIApplication *app = [UIApplication sharedApplication];
+    @try {
+        UIApplication *app = [UIApplication sharedApplication];
+        if (!app) return;
 
-    // Find best app window (skip our overlay)
-    UIWindow *win = nil;
-    for (UIWindow *w in app.windows) {
-        if (w.isHidden || w.alpha <= 0) continue;
-        if ([NSStringFromClass([w class]) isEqualToString:@"ACOverlayWindow"]) continue;
-        if (!win || w.windowLevel > win.windowLevel) win = w;
-    }
-    if (!win) return;
+        // Find best non-overlay window
+        UIWindow *win = nil;
+        NSArray *wins = [app valueForKey:@"windows"] ?: @[];
+        for (UIWindow *w in wins) {
+            if (w.isHidden || w.alpha <= 0) continue;
+            if ([NSStringFromClass([w class]) isEqualToString:@"ACOverlayWindow"]) continue;
+            if (!win || w.windowLevel > win.windowLevel) win = w;
+        }
+        if (!win) return;
 
-    UIView *hitView = [win hitTest:point withEvent:nil] ?: win;
-    NSTimeInterval ts = [NSProcessInfo processInfo].systemUptime;
+        UIView *hitView = [win hitTest:point withEvent:nil] ?: win;
+        NSTimeInterval ts = [NSProcessInfo processInfo].systemUptime;
 
-    UITouch *touch = [[UITouch alloc] initAtPoint:point inWindow:win];
-    [touch _setPhase:UITouchPhaseBegan];
-    [touch _setTimestamp:ts];
-    [touch _setView:hitView];
-    [touch _setTapCount:1];
+        // Guard every private selector before calling
+        SEL initSel  = NSSelectorFromString(@"initAtPoint:inWindow:");
+        SEL phaseSel = NSSelectorFromString(@"_setPhase:");
+        SEL tsSel    = NSSelectorFromString(@"_setTimestamp:");
+        SEL viewSel  = NSSelectorFromString(@"_setView:");
+        SEL tapSel   = NSSelectorFromString(@"_setTapCount:");
+        SEL evtSel   = NSSelectorFromString(@"_touchesEvent");
+        SEL clrSel   = NSSelectorFromString(@"_clearTouches");
+        SEL addSel   = NSSelectorFromString(@"_addTouch:forDelayedDelivery:");
 
-    UIEvent *evt = [app _touchesEvent];
-    [evt _clearTouches];
-    [evt _addTouch:touch forDelayedDelivery:NO];
-    [app sendEvent:evt];
+        if (![UITouch instancesRespondToSelector:initSel]) return;
+        if (![app respondsToSelector:evtSel]) return;
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-        [touch _setPhase:UITouchPhaseEnded];
-        [touch _setTimestamp:[NSProcessInfo processInfo].systemUptime];
-        [evt _clearTouches];
-        [evt _addTouch:touch forDelayedDelivery:NO];
+        UITouch *touch = [[UITouch alloc] init];
+        // Use performSelector via NSInvocation to avoid ARC warning on unknown selectors
+        {
+            NSMethodSignature *sig = [UITouch instanceMethodSignatureForSelector:initSel];
+            if (!sig) return;
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            inv.target   = touch;
+            inv.selector = initSel;
+            [inv setArgument:&point atIndex:2];
+            [inv setArgument:&win   atIndex:3];
+            [inv invoke];
+            __unsafe_unretained UITouch *ret;
+            [inv getReturnValue:&ret];
+            touch = ret;
+        }
+        if (!touch) return;
+
+        UITouchPhase began = UITouchPhaseBegan;
+        if ([touch respondsToSelector:phaseSel]) {
+            NSMethodSignature *sig = [touch methodSignatureForSelector:phaseSel];
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            inv.target = touch; inv.selector = phaseSel;
+            [inv setArgument:&began atIndex:2]; [inv invoke];
+        }
+        if ([touch respondsToSelector:tsSel]) {
+            NSMethodSignature *sig = [touch methodSignatureForSelector:tsSel];
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            inv.target = touch; inv.selector = tsSel;
+            [inv setArgument:&ts atIndex:2]; [inv invoke];
+        }
+        if ([touch respondsToSelector:viewSel]) {
+            NSMethodSignature *sig = [touch methodSignatureForSelector:viewSel];
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            inv.target = touch; inv.selector = viewSel;
+            [inv setArgument:&hitView atIndex:2]; [inv invoke];
+        }
+        NSUInteger tapCount = 1;
+        if ([touch respondsToSelector:tapSel]) {
+            NSMethodSignature *sig = [touch methodSignatureForSelector:tapSel];
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            inv.target = touch; inv.selector = tapSel;
+            [inv setArgument:&tapCount atIndex:2]; [inv invoke];
+        }
+
+        UIEvent *evt = [app performSelector:evtSel];
+        if (!evt) return;
+        if ([evt respondsToSelector:clrSel]) [evt performSelector:clrSel];
+        if ([evt respondsToSelector:addSel]) {
+            NSMethodSignature *sig = [evt methodSignatureForSelector:addSel];
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            inv.target = evt; inv.selector = addSel;
+            BOOL delayed = NO;
+            [inv setArgument:&touch   atIndex:2];
+            [inv setArgument:&delayed atIndex:3];
+            [inv invoke];
+        }
         [app sendEvent:evt];
-    });
+
+        // End touch after 60ms
+        UITouch *touchRef = touch;
+        UIEvent *evtRef   = evt;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+            @try {
+                NSTimeInterval ts2 = [NSProcessInfo processInfo].systemUptime;
+                UITouchPhase ended = UITouchPhaseEnded;
+                if ([touchRef respondsToSelector:phaseSel]) {
+                    NSMethodSignature *sig = [touchRef methodSignatureForSelector:phaseSel];
+                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                    inv.target = touchRef; inv.selector = phaseSel;
+                    [inv setArgument:&ended atIndex:2]; [inv invoke];
+                }
+                if ([touchRef respondsToSelector:tsSel]) {
+                    NSMethodSignature *sig = [touchRef methodSignatureForSelector:tsSel];
+                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                    inv.target = touchRef; inv.selector = tsSel;
+                    [inv setArgument:&ts2 atIndex:2]; [inv invoke];
+                }
+                if ([evtRef respondsToSelector:clrSel]) [evtRef performSelector:clrSel];
+                if ([evtRef respondsToSelector:addSel]) {
+                    NSMethodSignature *sig = [evtRef methodSignatureForSelector:addSel];
+                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                    inv.target = evtRef; inv.selector = addSel;
+                    BOOL delayed = NO;
+                    [inv setArgument:&touchRef atIndex:2];
+                    [inv setArgument:&delayed  atIndex:3];
+                    [inv invoke];
+                }
+                [app sendEvent:evtRef];
+            } @catch (NSException *e) {}
+        });
+    } @catch (NSException *e) {}
 }
 
 // ============================================================
@@ -210,11 +276,22 @@ static void AC_Inject(CGPoint point) {
     bar.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
     [self addSubview:bar];
 
-    UILabel *ttl = [[UILabel alloc] initWithFrame:CGRectMake(12, 0, W - 24, 38)];
+    UILabel *ttl = [[UILabel alloc] initWithFrame:CGRectMake(12, 0, W - 52, 38)];
     ttl.text      = @"AutoClicker";
     ttl.textColor = [UIColor whiteColor];
     ttl.font      = [UIFont boldSystemFontOfSize:14];
     [bar addSubview:ttl];
+
+    // Minimize button
+    UIButton *minBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    minBtn.frame = CGRectMake(W - 42, 7, 28, 24);
+    minBtn.backgroundColor = [UIColor colorWithWhite:1 alpha:0.15];
+    minBtn.layer.cornerRadius = 6;
+    [minBtn setTitle:@"—" forState:UIControlStateNormal];
+    [minBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    minBtn.titleLabel.font = [UIFont systemFontOfSize:13];
+    [minBtn addTarget:self action:@selector(onMinimize) forControlEvents:UIControlEventTouchUpInside];
+    [bar addSubview:minBtn];
 
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPan:)];
     [bar addGestureRecognizer:pan];
@@ -325,6 +402,24 @@ static void AC_Inject(CGPoint point) {
 }
 
 // ---- Actions ----
+
+- (void)onMinimize {
+    BOOL isMin = self.frame.size.height == 38;
+    CGRect f   = self.frame;
+    if (isMin) {
+        // restore
+        f.size.height = (_modeSeg.selectedSegmentIndex == 1) ? 326 : 272;
+        self.frame = f;
+        for (UIView *v in self.subviews)
+            if (v.tag != 99) v.hidden = NO;
+    } else {
+        // minimize — hide everything except title bar
+        f.size.height = 38;
+        self.frame = f;
+        for (UIView *v in self.subviews)
+            if (v.tag != 99) v.hidden = (v != [self.subviews firstObject]);
+    }
+}
 
 - (void)onPan:(UIPanGestureRecognizer *)gr {
     CGPoint t = [gr translationInView:self.superview];
