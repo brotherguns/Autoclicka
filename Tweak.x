@@ -323,8 +323,10 @@ static void AC_Inject(CGPoint point) {
 
 @implementation ACOverlayWindow
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
-    UIView *v = [super hitTest:p withEvent:e];
-    return (v == self) ? nil : v; // pass through if nothing inside was hit
+    UIView *hit = [super hitTest:p withEvent:e];
+    // Only claim the hit if it landed on a real subview (panel or capture overlay)
+    // If it hit the window background itself, pass through to underlying app
+    return (hit == self) ? nil : hit;
 }
 @end
 
@@ -620,7 +622,8 @@ static void AC_Inject(CGPoint point) {
 
 - (void)showCaptureOverlay:(void(^)(CGPoint))cb {
     _captureCallback = cb;
-    UIView *sup = self.superview;
+    // Add to the window directly, not rootVC.view (which has userInteractionEnabled=NO)
+    UIView *sup = self.window ?: self.superview;
     if (!sup) return;
 
     CGRect screen = [UIScreen mainScreen].bounds;
@@ -639,12 +642,12 @@ static void AC_Inject(CGPoint point) {
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onCaptureTap:)];
     [_captureOverlay addGestureRecognizer:tap];
     [sup addSubview:_captureOverlay];
-    [sup bringSubviewToFront:self]; // keep panel on top of overlay
+    [sup bringSubviewToFront:self];
 }
 
 - (void)showRecordingOverlay:(void(^)(CGPoint))cb {
     _captureCallback = cb;
-    UIView *sup = self.superview;
+    UIView *sup = self.window ?: self.superview;
     if (!sup) return;
 
     CGRect screen = [UIScreen mainScreen].bounds;
@@ -712,15 +715,23 @@ static void AC_Inject(CGPoint point) {
         }
     }
 
-    _win.windowLevel       = UIWindowLevelStatusBar + 500;
+    // Keep window level reasonable — high enough to float above app, low enough
+    // not to intercept system gestures or steal touches from the app
+    _win.windowLevel       = UIWindowLevelNormal + 1;
     _win.backgroundColor   = [UIColor clearColor];
+    // Disable interaction on the window itself; only the panel will be interactive
+    _win.userInteractionEnabled = YES;
 
     UIViewController *rootVC = [UIViewController new];
     rootVC.view.backgroundColor = [UIColor clearColor];
+    // Critical: disable interaction on the root view background so touches fall through
+    rootVC.view.userInteractionEnabled = NO;
     _win.rootViewController = rootVC;
     _win.hidden = NO;
 
     ACPanel *panel = [ACPanel make];
+    // Only the panel itself handles touches
+    panel.userInteractionEnabled = YES;
     [rootVC.view addSubview:panel];
 }
 
