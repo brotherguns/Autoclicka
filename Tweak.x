@@ -1,5 +1,5 @@
 // UniversalAutoClicker - Tweak.x
-// Direct UITouch injection - confirmed working approach from reference binary analysis
+// Direct UITouch injection with debug logging
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -7,7 +7,6 @@
 
 // ============================================================
 // MARK: - Private API declarations
-// Suppress ARC warnings — we know what we're doing
 // ============================================================
 
 #pragma clang diagnostic push
@@ -20,7 +19,6 @@
 - (void)_setTimestamp:(NSTimeInterval)timestamp;
 - (void)_setView:(UIView *)view;
 - (void)_setTapCount:(NSUInteger)tapCount;
-- (void)_setLocationInWindow:(CGPoint)location resetPrevious:(BOOL)reset;
 - (void)_setHIDEvent:(CFTypeRef)event;
 @end
 
@@ -36,56 +34,107 @@
 #pragma clang diagnostic pop
 
 // ============================================================
+// MARK: - Debug
+// ============================================================
+
+static NSString *_lastDebug = @"No inject yet";
+
+static void AC_Debug(NSString *msg) {
+    _lastDebug = msg;
+    NSLog(@"[AutoClicker] %@", msg);
+}
+
+static void AC_CheckSelectors(void) {
+    BOOL hasInit    = [UITouch instancesRespondToSelector:NSSelectorFromString(@"initAtPoint:inWindow:")];
+    BOOL hasPhase   = [UITouch instancesRespondToSelector:NSSelectorFromString(@"_setPhase:")];
+    BOOL hasHID     = [UITouch instancesRespondToSelector:NSSelectorFromString(@"_setHIDEvent:")];
+    BOOL hasTchEvt  = [[UIApplication sharedApplication] respondsToSelector:NSSelectorFromString(@"_touchesEvent")];
+    BOOL hasAddTch  = NO;
+
+    UIEvent *evt = [[UIApplication sharedApplication] _touchesEvent];
+    if (evt) hasAddTch = [evt respondsToSelector:NSSelectorFromString(@"_addTouch:forDelayedDelivery:")];
+
+    AC_Debug([NSString stringWithFormat:
+        @"Selectors: initAtPoint=%d _setPhase=%d _setHIDEvent=%d _touchesEvent=%d _addTouch=%d event=%@",
+        hasInit, hasPhase, hasHID, hasTchEvt, hasAddTch, evt ? @"OK" : @"nil"]);
+}
+
+// ============================================================
 // MARK: - Injection
 // ============================================================
 
 static void AC_Inject(CGPoint point) {
     @try {
         UIApplication *app = [UIApplication sharedApplication];
-        if (!app) return;
+        if (!app) { AC_Debug(@"FAIL: no app"); return; }
 
-        // Find the app window (not our overlay)
         UIWindow *win = nil;
         for (UIWindow *w in [app valueForKey:@"windows"] ?: @[]) {
             if (w.isHidden || w.alpha <= 0) continue;
             if ([NSStringFromClass([w class]) isEqualToString:@"ACOverlayWindow"]) continue;
             if (!win || w.windowLevel > win.windowLevel) win = w;
         }
-        if (!win) return;
+        if (!win) { AC_Debug(@"FAIL: no window"); return; }
 
         UIView *hitView = [win hitTest:point withEvent:nil] ?: win;
+        AC_Debug([NSString stringWithFormat:@"Injecting at (%.0f,%.0f) into %@", point.x, point.y, NSStringFromClass([hitView class])]);
 
-        // ----- Touch Down -----
-        UITouch *touch = [[UITouch alloc] initAtPoint:point inWindow:win];
-        if (!touch) return;
-        [touch _setPhase:UITouchPhaseBegan];
-        [touch _setTimestamp:[NSProcessInfo processInfo].systemUptime];
-        [touch _setView:hitView];
-        [touch _setTapCount:1];
+        // Method 1: UITouch + sendEvent:
+        SEL initSel = NSSelectorFromString(@"initAtPoint:inWindow:");
+        SEL evtSel  = NSSelectorFromString(@"_touchesEvent");
 
-        UIEvent *event = [app _touchesEvent];
-        if (!event) return;
-        [event _clearTouches];
-        [event _addTouch:touch forDelayedDelivery:NO];
-        [app sendEvent:event];
-
-        // Also call touchesBegan directly on the view as fallback
-        NSSet *touches = [NSSet setWithObject:touch];
-        [hitView touchesBegan:touches withEvent:event];
-
-        // ----- Touch Up (80ms later) -----
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC),
-                       dispatch_get_main_queue(), ^{
-            @try {
-                [touch _setPhase:UITouchPhaseEnded];
+        if ([UITouch instancesRespondToSelector:initSel] && [app respondsToSelector:evtSel]) {
+            UITouch *touch = [[UITouch alloc] initAtPoint:point inWindow:win];
+            if (touch) {
+                [touch _setPhase:UITouchPhaseBegan];
                 [touch _setTimestamp:[NSProcessInfo processInfo].systemUptime];
-                [event _clearTouches];
-                [event _addTouch:touch forDelayedDelivery:NO];
-                [app sendEvent:event];
-                [hitView touchesEnded:touches withEvent:event];
-            } @catch (...) {}
-        });
-    } @catch (...) {}
+                [touch _setView:hitView];
+                [touch _setTapCount:1];
+
+                UIEvent *event = [app _touchesEvent];
+                if (event) {
+                    [event _clearTouches];
+                    [event _addTouch:touch forDelayedDelivery:NO];
+                    [app sendEvent:event];
+                    AC_Debug([NSString stringWithFormat:@"sendEvent OK - view: %@", NSStringFromClass([hitView class])]);
+
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC),
+                                   dispatch_get_main_queue(), ^{
+                        @try {
+                            [touch _setPhase:UITouchPhaseEnded];
+                            [touch _setTimestamp:[NSProcessInfo processInfo].systemUptime];
+                            [event _clearTouches];
+                            [event _addTouch:touch forDelayedDelivery:NO];
+                            [app sendEvent:event];
+                        } @catch (...) {}
+                    });
+                    return;
+                } else {
+                    AC_Debug(@"FAIL: _touchesEvent returned nil");
+                }
+            } else {
+                AC_Debug(@"FAIL: UITouch alloc/init returned nil");
+            }
+        } else {
+            AC_Debug([NSString stringWithFormat:@"FAIL: missing selectors initAtPoint=%d _touchesEvent=%d",
+                [UITouch instancesRespondToSelector:initSel],
+                [app respondsToSelector:evtSel]]);
+        }
+
+        // Method 2: Direct touchesBegan fallback
+        AC_Debug(@"Trying direct touchesBegan fallback");
+        UITouch *t2 = [[UITouch alloc] init];
+        if (t2) {
+            NSSet *set = [NSSet setWithObject:t2];
+            [hitView touchesBegan:set withEvent:nil];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{
+                @try { [hitView touchesEnded:set withEvent:nil]; } @catch(...) {}
+            });
+        }
+    } @catch (NSException *e) {
+        AC_Debug([NSString stringWithFormat:@"EXCEPTION: %@", e]);
+    }
 }
 
 // ============================================================
@@ -276,6 +325,28 @@ static void AC_Inject(CGPoint point) {
     [self addSubview:_startBtn];
     y += 42;
 
+    // ---- Debug label ----
+    UILabel *dbg = [[UILabel alloc] initWithFrame:CGRectMake(x, y, w, 28)];
+    dbg.tag = 77;
+    dbg.text = @"Tap DBG to check selectors";
+    dbg.textColor = [UIColor colorWithWhite:0.5 alpha:1];
+    dbg.font = [UIFont systemFontOfSize:8];
+    dbg.numberOfLines = 2;
+    [self addSubview:dbg];
+    y += 32;
+
+    UIButton *dbgBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    dbgBtn.frame = CGRectMake(x, y, w, 22);
+    dbgBtn.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1];
+    dbgBtn.layer.cornerRadius = 5;
+    [dbgBtn setTitle:@"DBG: Check Selectors" forState:UIControlStateNormal];
+    [dbgBtn setTitleColor:[UIColor colorWithWhite:0.7 alpha:1] forState:UIControlStateNormal];
+    dbgBtn.titleLabel.font = [UIFont systemFontOfSize:9];
+    [dbgBtn addTarget:self action:@selector(onDebug:) forControlEvents:UIControlEventTouchUpInside];
+    dbgBtn.tag = 78;
+    [self addSubview:dbgBtn];
+    y += 28;
+
     // ---- Mode ----
     _modeSeg = [[UISegmentedControl alloc] initWithItems:@[@"Single", @"Sequence"]];
     _modeSeg.frame = CGRectMake(x, y, w, 28);
@@ -368,6 +439,16 @@ static void AC_Inject(CGPoint point) {
 }
 
 // ---- Actions ----
+
+- (void)onDebug:(UIButton *)btn {
+    AC_CheckSelectors();
+    // Fire a test inject at current single point
+    AC_Inject([ACEngine shared].singlePoint);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        UILabel *lbl = (UILabel *)[self viewWithTag:77];
+        lbl.text = _lastDebug;
+    });
+}
 
 - (void)onMinimize {
     BOOL isMin = self.frame.size.height == 38;
@@ -608,5 +689,6 @@ static void AC_Inject(CGPoint point) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         [[ACManager shared] setup];
+        AC_CheckSelectors();
     });
 }
