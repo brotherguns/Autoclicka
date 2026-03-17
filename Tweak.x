@@ -314,6 +314,16 @@ static void AC_Inject(CGPoint point) {
 
 @end
 
+// Pass-through root view — only claims hits on actual subviews, not its own background
+@interface ACPassthroughView : UIView
+@end
+@implementation ACPassthroughView
+- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
+    UIView *hit = [super hitTest:p withEvent:e];
+    return (hit == self) ? nil : hit;
+}
+@end
+
 // ============================================================
 // MARK: - Pass-through Overlay Window
 // ============================================================
@@ -723,14 +733,14 @@ static void AC_Inject(CGPoint point) {
     _win.userInteractionEnabled = YES;
 
     UIViewController *rootVC = [UIViewController new];
-    rootVC.view.backgroundColor = [UIColor clearColor];
-    // Critical: disable interaction on the root view background so touches fall through
-    rootVC.view.userInteractionEnabled = NO;
+    // Use passthrough view so background passes touches to the app underneath
+    ACPassthroughView *ptView = [[ACPassthroughView alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    ptView.backgroundColor = [UIColor clearColor];
+    rootVC.view = ptView;
     _win.rootViewController = rootVC;
     _win.hidden = NO;
 
     ACPanel *panel = [ACPanel make];
-    // Only the panel itself handles touches
     panel.userInteractionEnabled = YES;
     [rootVC.view addSubview:panel];
 }
