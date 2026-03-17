@@ -43,17 +43,15 @@ static void AC_LoadIOHID(void) {
 
 static IOHIDEventRef AC_MakeHIDEvent(CGPoint pt, bool down) {
     if (!_createFinger) return NULL;
-    CGRect bounds = [UIScreen mainScreen].bounds;
-    double nx = pt.x / bounds.size.width;
-    double ny = pt.y / bounds.size.height;
     uint32_t mask = kIOHIDDigitizerEventPosition;
     if (down) mask |= (kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventRange);
+    // IOHIDEventCreateDigitizerFingerEvent expects actual point coords (not normalized, not pixels)
     return _createFinger(
         kCFAllocatorDefault, mach_absolute_time(),
         1, 1, mask,
-        nx, ny, 0,
-        down ? 1.0 : 0.0, 0,
-        5, 5,
+        pt.x, pt.y, 0,          // x, y in UIKit points
+        down ? 1.0 : 0.0, 0,    // pressure, twist
+        5, 5,                    // minor/major radius
         down, down, 0
     );
 }
@@ -187,6 +185,16 @@ static void AC_Inject(CGPoint point) {
             }
             [app sendEvent:evt];
         }
+
+        // Also enqueue raw HID event — games that bypass UIKit pick this up
+        SEL enqueueSel = NSSelectorFromString(@"_enqueueHIDEvent:");
+        if (hidEvt && [app respondsToSelector:enqueueSel]) {
+            NSMethodSignature *sig = [app methodSignatureForSelector:enqueueSel];
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            inv.target = app; inv.selector = enqueueSel;
+            [inv setArgument:&hidEvt atIndex:2];
+            [inv invoke];
+        }
         if (hidEvt) CFRelease(hidEvt);
 
         // End touch after 80ms
@@ -228,6 +236,14 @@ static void AC_Inject(CGPoint point) {
                         [inv invoke];
                     }
                     [app sendEvent:evt];
+                }
+                SEL enqueueSel = NSSelectorFromString(@"_enqueueHIDEvent:");
+                if (hidEnd && [app respondsToSelector:enqueueSel]) {
+                    NSMethodSignature *sig = [app methodSignatureForSelector:enqueueSel];
+                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                    inv.target = app; inv.selector = enqueueSel;
+                    [inv setArgument:&hidEnd atIndex:2];
+                    [inv invoke];
                 }
                 if (hidEnd) CFRelease(hidEnd);
             } @catch(...) {}
