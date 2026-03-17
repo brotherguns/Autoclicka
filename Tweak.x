@@ -45,18 +45,41 @@ static void AC_Debug(NSString *msg) {
 }
 
 static void AC_CheckSelectors(void) {
-    BOOL hasInit    = [UITouch instancesRespondToSelector:NSSelectorFromString(@"initAtPoint:inWindow:")];
-    BOOL hasPhase   = [UITouch instancesRespondToSelector:NSSelectorFromString(@"_setPhase:")];
-    BOOL hasHID     = [UITouch instancesRespondToSelector:NSSelectorFromString(@"_setHIDEvent:")];
-    BOOL hasTchEvt  = [[UIApplication sharedApplication] respondsToSelector:NSSelectorFromString(@"_touchesEvent")];
-    BOOL hasAddTch  = NO;
+    // Dump all UITouch instance methods containing "init" or "point" or "hid" or "phase"
+    NSMutableString *out = [NSMutableString string];
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList([UITouch class], &count);
+    for (unsigned int i = 0; i < count; i++) {
+        NSString *name = NSStringFromSelector(method_getName(methods[i]));
+        if ([name containsString:@"init"] || [name containsString:@"point"] ||
+            [name containsString:@"Point"] || [name containsString:@"phase"] ||
+            [name containsString:@"Phase"] || [name containsString:@"hid"] ||
+            [name containsString:@"HID"] || [name containsString:@"window"] ||
+            [name containsString:@"Window"]) {
+            [out appendFormat:@"%@\n", name];
+        }
+    }
+    free(methods);
 
-    UIEvent *evt = [[UIApplication sharedApplication] _touchesEvent];
-    if (evt) hasAddTch = [evt respondsToSelector:NSSelectorFromString(@"_addTouch:forDelayedDelivery:")];
+    // Also check UIApplication for touch event selectors
+    [out appendString:@"---UIApp---\n"];
+    Method *appMethods = class_copyMethodList([UIApplication class], &count);
+    for (unsigned int i = 0; i < count; i++) {
+        NSString *name = NSStringFromSelector(method_getName(appMethods[i]));
+        if ([name containsString:@"touch"] || [name containsString:@"Touch"] ||
+            [name containsString:@"HID"] || [name containsString:@"hid"] ||
+            [name containsString:@"event"] || [name containsString:@"Event"]) {
+            [out appendFormat:@"%@\n", name];
+        }
+    }
+    free(appMethods);
 
-    AC_Debug([NSString stringWithFormat:
-        @"Selectors: initAtPoint=%d _setPhase=%d _setHIDEvent=%d _touchesEvent=%d _addTouch=%d event=%@",
-        hasInit, hasPhase, hasHID, hasTchEvt, hasAddTch, evt ? @"OK" : @"nil"]);
+    AC_Debug(out);
+    // Also write to a file so you can read it fully
+    NSString *path = @"/var/mobile/Documents/ac_debug.txt";
+    NSError *err;
+    [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
+    if (!err) NSLog(@"[AutoClicker] Wrote debug to %@", path);
 }
 
 // ============================================================
