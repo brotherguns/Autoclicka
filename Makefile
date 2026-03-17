@@ -7,8 +7,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = UniversalAutoClicker
 
 UniversalAutoClicker_FILES       = Tweak.x
-UniversalAutoClicker_FRAMEWORKS  = UIKit Foundation CoreGraphics IOKit
-UniversalAutoClicker_PRIVATE_FRAMEWORKS =
+UniversalAutoClicker_FRAMEWORKS  = UIKit Foundation CoreGraphics
 UniversalAutoClicker_CFLAGS      = -fobjc-arc -Wno-deprecated-declarations
 UniversalAutoClicker_LDFLAGS     = -lz
 

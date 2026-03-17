@@ -1,127 +1,91 @@
 // UniversalAutoClicker - Tweak.x
-// Hybrid injection: IOHIDEventSystemClientDispatchEvent (hardware-level, works in games)
+// Direct UITouch injection - confirmed working approach from reference binary analysis
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
-#import <dlfcn.h>
-#import <mach/mach_time.h>
-#import <IOKit/hid/IOHIDEvent.h>
 
 // ============================================================
-// MARK: - IOHIDEvent function pointers
+// MARK: - Private API declarations
+// Suppress ARC warnings — we know what we're doing
 // ============================================================
 
-typedef CFTypeRef IOHIDEventSystemClientRef;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wincomplete-implementation"
+#pragma clang diagnostic ignored "-Wobjc-protocol-method-implementation"
 
-typedef IOHIDEventRef (*_IOHIDCreateDigitizerEvent)(
-    CFAllocatorRef, uint64_t,
-    IOHIDDigitizerTransducerType,
-    uint32_t, uint32_t, IOHIDDigitizerEventMask,
-    uint32_t,
-    IOHIDFloat, IOHIDFloat, IOHIDFloat,
-    IOHIDFloat, IOHIDFloat,
-    IOHIDFloat, IOHIDFloat,
-    Boolean, Boolean, IOHIDEventOptionBits);
+@interface UITouch (AC)
+- (id)initAtPoint:(CGPoint)point inWindow:(UIWindow *)window;
+- (void)_setPhase:(UITouchPhase)phase;
+- (void)_setTimestamp:(NSTimeInterval)timestamp;
+- (void)_setView:(UIView *)view;
+- (void)_setTapCount:(NSUInteger)tapCount;
+- (void)_setLocationInWindow:(CGPoint)location resetPrevious:(BOOL)reset;
+- (void)_setHIDEvent:(CFTypeRef)event;
+@end
 
-typedef IOHIDEventRef (*_IOHIDCreateFingerEvent)(
-    CFAllocatorRef, uint64_t,
-    uint32_t, uint32_t, IOHIDDigitizerEventMask,
-    IOHIDFloat, IOHIDFloat, IOHIDFloat,
-    IOHIDFloat, IOHIDFloat,
-    IOHIDFloat, IOHIDFloat,
-    Boolean, Boolean, IOHIDEventOptionBits);
+@interface UIEvent (AC)
+- (void)_clearTouches;
+- (void)_addTouch:(UITouch *)touch forDelayedDelivery:(BOOL)delayed;
+@end
 
-typedef void     (*_IOHIDEventAppend)(IOHIDEventRef, IOHIDEventRef);
-typedef void     (*_IOHIDEventSetSenderID)(IOHIDEventRef, uint64_t);
-typedef CFTypeRef(*_IOHIDSysClientCreate)(CFAllocatorRef);
-typedef void     (*_IOHIDSysClientDispatch)(IOHIDEventSystemClientRef, IOHIDEventRef);
+@interface UIApplication (AC)
+- (UIEvent *)_touchesEvent;
+@end
 
-static _IOHIDCreateDigitizerEvent  _createDigitizer  = NULL;
-static _IOHIDCreateFingerEvent     _createFinger     = NULL;
-static _IOHIDEventAppend           _appendEvent      = NULL;
-static _IOHIDEventSetSenderID      _setSenderID      = NULL;
-static _IOHIDSysClientCreate       _sysClientCreate  = NULL;
-static _IOHIDSysClientDispatch     _sysClientDispatch = NULL;
-static IOHIDEventSystemClientRef   _sysClient        = NULL;
-
-static void AC_LoadIOHID(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
-        if (!h) return;
-        _createDigitizer   = (_IOHIDCreateDigitizerEvent) dlsym(h, "IOHIDEventCreateDigitizerEvent");
-        _createFinger      = (_IOHIDCreateFingerEvent)    dlsym(h, "IOHIDEventCreateDigitizerFingerEvent");
-        _appendEvent       = (_IOHIDEventAppend)          dlsym(h, "IOHIDEventAppendEvent");
-        _setSenderID       = (_IOHIDEventSetSenderID)     dlsym(h, "IOHIDEventSetSenderID");
-        _sysClientCreate   = (_IOHIDSysClientCreate)      dlsym(h, "IOHIDEventSystemClientCreate");
-        _sysClientDispatch = (_IOHIDSysClientDispatch)    dlsym(h, "IOHIDEventSystemClientDispatchEvent");
-        if (_sysClientCreate)
-            _sysClient = _sysClientCreate(kCFAllocatorDefault);
-    });
-}
+#pragma clang diagnostic pop
 
 // ============================================================
 // MARK: - Injection
 // ============================================================
 
-#define AC_SENDER_ID 0x8000000817319375ULL
-
-static void AC_SendHIDTouch(CGPoint pt, BOOL down) {
-    if (!_createDigitizer || !_createFinger || !_appendEvent) return;
-    if (!_sysClientDispatch || !_sysClient) return;
-
-    CGRect bounds = [UIScreen mainScreen].bounds;
-    IOHIDFloat xf = pt.x / bounds.size.width;
-    IOHIDFloat yf = pt.y / bounds.size.height;
-    uint64_t ts = mach_absolute_time();
-
-    uint32_t parentFlags, childFlags;
-    if (down) {
-        parentFlags = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventIdentity;
-        childFlags  = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch;
-    } else {
-        parentFlags = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch |
-                      kIOHIDDigitizerEventIdentity | kIOHIDDigitizerEventPosition;
-        childFlags  = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch;
-    }
-
-    IOHIDEventRef parent = _createDigitizer(
-        kCFAllocatorDefault, ts,
-        kIOHIDDigitizerTransducerTypeHand,
-        1 << 22, 1, parentFlags, 0,
-        xf, yf, 0, 0, 0, 0, 0,
-        down, down, 0);
-    if (!parent) return;
-
-    if (_setSenderID) _setSenderID(parent, AC_SENDER_ID);
-
-    IOHIDEventRef child = _createFinger(
-        kCFAllocatorDefault, ts,
-        3, 2, childFlags,
-        xf, yf, 0,
-        down ? 1.0 : 0.0, 0,
-        5, 5,
-        down, down, 0);
-
-    if (child) {
-        _appendEvent(parent, child);
-        CFRelease(child);
-    }
-
-    // Dispatch through IOHIDEventSystemClient — hardware-level path, works in all apps/games
-    _sysClientDispatch(_sysClient, parent);
-    CFRelease(parent);
-}
-
 static void AC_Inject(CGPoint point) {
     @try {
-        AC_SendHIDTouch(point, YES);
+        UIApplication *app = [UIApplication sharedApplication];
+        if (!app) return;
+
+        // Find the app window (not our overlay)
+        UIWindow *win = nil;
+        for (UIWindow *w in [app valueForKey:@"windows"] ?: @[]) {
+            if (w.isHidden || w.alpha <= 0) continue;
+            if ([NSStringFromClass([w class]) isEqualToString:@"ACOverlayWindow"]) continue;
+            if (!win || w.windowLevel > win.windowLevel) win = w;
+        }
+        if (!win) return;
+
+        UIView *hitView = [win hitTest:point withEvent:nil] ?: win;
+
+        // ----- Touch Down -----
+        UITouch *touch = [[UITouch alloc] initAtPoint:point inWindow:win];
+        if (!touch) return;
+        [touch _setPhase:UITouchPhaseBegan];
+        [touch _setTimestamp:[NSProcessInfo processInfo].systemUptime];
+        [touch _setView:hitView];
+        [touch _setTapCount:1];
+
+        UIEvent *event = [app _touchesEvent];
+        if (!event) return;
+        [event _clearTouches];
+        [event _addTouch:touch forDelayedDelivery:NO];
+        [app sendEvent:event];
+
+        // Also call touchesBegan directly on the view as fallback
+        NSSet *touches = [NSSet setWithObject:touch];
+        [hitView touchesBegan:touches withEvent:event];
+
+        // ----- Touch Up (80ms later) -----
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
-            @try { AC_SendHIDTouch(point, NO); } @catch(...) {}
+            @try {
+                [touch _setPhase:UITouchPhaseEnded];
+                [touch _setTimestamp:[NSProcessInfo processInfo].systemUptime];
+                [event _clearTouches];
+                [event _addTouch:touch forDelayedDelivery:NO];
+                [app sendEvent:event];
+                [hitView touchesEnded:touches withEvent:event];
+            } @catch (...) {}
         });
-    } @catch(...) {}
+    } @catch (...) {}
 }
 
 // ============================================================
@@ -641,7 +605,6 @@ static void AC_Inject(CGPoint point) {
 // ============================================================
 
 %ctor {
-    AC_LoadIOHID();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         [[ACManager shared] setup];
