@@ -34,10 +34,10 @@ jobs:
         run: |
           if [ ! -d "$THEOS/sdks/iPhoneOS16.5.sdk" ]; then
             curl -L \
-              "https://github.com/xybp888/iOS-SDKs/releases/download/download/iPhoneOS16.5.sdk.zip" \
-              -o sdk.zip
-            unzip -q sdk.zip -d $THEOS/sdks/
-            rm sdk.zip
+              "https://github.com/theos/sdks/releases/download/default/iPhoneOS16.5.sdk.tar.xz" \
+              -o sdk.tar.xz
+            tar -xf sdk.tar.xz -C $THEOS/sdks/
+            rm sdk.tar.xz
           fi
 
       - name: Build
