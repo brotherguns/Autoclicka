@@ -75,11 +75,15 @@ static void AC_CheckSelectors(void) {
     free(appMethods);
 
     AC_Debug(out);
-    // Also write to a file so you can read it fully
-    NSString *path = @"/var/mobile/Documents/ac_debug.txt";
+    // Write to app's own Documents directory
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *docs = [paths firstObject];
+    NSString *path = [docs stringByAppendingPathComponent:@"ac_debug.txt"];
     NSError *err;
     [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
-    if (!err) NSLog(@"[AutoClicker] Wrote debug to %@", path);
+    NSLog(@"[AutoClicker] Debug file: %@ err=%@", path, err);
+    // Also show path on label
+    _lastDebug = [NSString stringWithFormat:@"Saved to:\n%@", path];
 }
 
 // ============================================================
