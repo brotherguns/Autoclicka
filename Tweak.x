@@ -10,12 +10,20 @@
 // MARK: - Touch Injection
 // ============================================================
 
+// Helper: call a void method with no args via NSInvocation
+static void AC_CallVoid(id obj, SEL sel) {
+    NSMethodSignature *sig = [obj methodSignatureForSelector:sel];
+    if (!sig) return;
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    inv.target = obj; inv.selector = sel;
+    [inv invoke];
+}
+
 static void AC_Inject(CGPoint point) {
     @try {
         UIApplication *app = [UIApplication sharedApplication];
         if (!app) return;
 
-        // Find best non-overlay window
         UIWindow *win = nil;
         NSArray *wins = [app valueForKey:@"windows"] ?: @[];
         for (UIWindow *w in wins) {
@@ -28,7 +36,6 @@ static void AC_Inject(CGPoint point) {
         UIView *hitView = [win hitTest:point withEvent:nil] ?: win;
         NSTimeInterval ts = [NSProcessInfo processInfo].systemUptime;
 
-        // Guard every private selector before calling
         SEL initSel  = NSSelectorFromString(@"initAtPoint:inWindow:");
         SEL phaseSel = NSSelectorFromString(@"_setPhase:");
         SEL tsSel    = NSSelectorFromString(@"_setTimestamp:");
@@ -41,94 +48,112 @@ static void AC_Inject(CGPoint point) {
         if (![UITouch instancesRespondToSelector:initSel]) return;
         if (![app respondsToSelector:evtSel]) return;
 
-        UITouch *touch = [[UITouch alloc] init];
-        // Use performSelector via NSInvocation to avoid ARC warning on unknown selectors
+        // Init touch
+        __unsafe_unretained UITouch *rawTouch = nil;
         {
             NSMethodSignature *sig = [UITouch instanceMethodSignatureForSelector:initSel];
             if (!sig) return;
             NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            inv.target   = touch;
-            inv.selector = initSel;
+            UITouch *alloc = [UITouch alloc];
+            inv.target = alloc; inv.selector = initSel;
             [inv setArgument:&point atIndex:2];
             [inv setArgument:&win   atIndex:3];
             [inv invoke];
-            __unsafe_unretained UITouch *ret;
-            [inv getReturnValue:&ret];
-            touch = ret;
+            [inv getReturnValue:&rawTouch];
         }
+        UITouch *touch = rawTouch;
         if (!touch) return;
 
-        UITouchPhase began = UITouchPhaseBegan;
+        // setPhase: began
         if ([touch respondsToSelector:phaseSel]) {
             NSMethodSignature *sig = [touch methodSignatureForSelector:phaseSel];
             NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
             inv.target = touch; inv.selector = phaseSel;
+            UITouchPhase began = UITouchPhaseBegan;
             [inv setArgument:&began atIndex:2]; [inv invoke];
         }
+        // setTimestamp:
         if ([touch respondsToSelector:tsSel]) {
             NSMethodSignature *sig = [touch methodSignatureForSelector:tsSel];
             NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
             inv.target = touch; inv.selector = tsSel;
             [inv setArgument:&ts atIndex:2]; [inv invoke];
         }
+        // setView:
         if ([touch respondsToSelector:viewSel]) {
             NSMethodSignature *sig = [touch methodSignatureForSelector:viewSel];
             NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
             inv.target = touch; inv.selector = viewSel;
-            [inv setArgument:&hitView atIndex:2]; [inv invoke];
+            __unsafe_unretained UIView *rawView = hitView;
+            [inv setArgument:&rawView atIndex:2]; [inv invoke];
         }
-        NSUInteger tapCount = 1;
+        // setTapCount:
         if ([touch respondsToSelector:tapSel]) {
             NSMethodSignature *sig = [touch methodSignatureForSelector:tapSel];
             NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
             inv.target = touch; inv.selector = tapSel;
+            NSUInteger tapCount = 1;
             [inv setArgument:&tapCount atIndex:2]; [inv invoke];
         }
 
-        UIEvent *evt = [app performSelector:evtSel];
+        // Get event
+        __unsafe_unretained UIEvent *rawEvt = nil;
+        {
+            NSMethodSignature *sig = [app methodSignatureForSelector:evtSel];
+            if (!sig) return;
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            inv.target = app; inv.selector = evtSel;
+            [inv invoke];
+            [inv getReturnValue:&rawEvt];
+        }
+        UIEvent *evt = rawEvt;
         if (!evt) return;
-        if ([evt respondsToSelector:clrSel]) [evt performSelector:clrSel];
+
+        // clearTouches
+        if ([evt respondsToSelector:clrSel]) AC_CallVoid(evt, clrSel);
+
+        // addTouch:forDelayedDelivery:
         if ([evt respondsToSelector:addSel]) {
             NSMethodSignature *sig = [evt methodSignatureForSelector:addSel];
             NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
             inv.target = evt; inv.selector = addSel;
+            __unsafe_unretained UITouch *rawT = touch;
             BOOL delayed = NO;
-            [inv setArgument:&touch   atIndex:2];
+            [inv setArgument:&rawT    atIndex:2];
             [inv setArgument:&delayed atIndex:3];
             [inv invoke];
         }
         [app sendEvent:evt];
 
         // End touch after 60ms
-        UITouch *touchRef = touch;
-        UIEvent *evtRef   = evt;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
             @try {
                 NSTimeInterval ts2 = [NSProcessInfo processInfo].systemUptime;
                 UITouchPhase ended = UITouchPhaseEnded;
-                if ([touchRef respondsToSelector:phaseSel]) {
-                    NSMethodSignature *sig = [touchRef methodSignatureForSelector:phaseSel];
+                if ([touch respondsToSelector:phaseSel]) {
+                    NSMethodSignature *sig = [touch methodSignatureForSelector:phaseSel];
                     NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                    inv.target = touchRef; inv.selector = phaseSel;
+                    inv.target = touch; inv.selector = phaseSel;
                     [inv setArgument:&ended atIndex:2]; [inv invoke];
                 }
-                if ([touchRef respondsToSelector:tsSel]) {
-                    NSMethodSignature *sig = [touchRef methodSignatureForSelector:tsSel];
+                if ([touch respondsToSelector:tsSel]) {
+                    NSMethodSignature *sig = [touch methodSignatureForSelector:tsSel];
                     NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                    inv.target = touchRef; inv.selector = tsSel;
+                    inv.target = touch; inv.selector = tsSel;
                     [inv setArgument:&ts2 atIndex:2]; [inv invoke];
                 }
-                if ([evtRef respondsToSelector:clrSel]) [evtRef performSelector:clrSel];
-                if ([evtRef respondsToSelector:addSel]) {
-                    NSMethodSignature *sig = [evtRef methodSignatureForSelector:addSel];
+                if ([evt respondsToSelector:clrSel]) AC_CallVoid(evt, clrSel);
+                if ([evt respondsToSelector:addSel]) {
+                    NSMethodSignature *sig = [evt methodSignatureForSelector:addSel];
                     NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                    inv.target = evtRef; inv.selector = addSel;
+                    inv.target = evt; inv.selector = addSel;
+                    __unsafe_unretained UITouch *rawT = touch;
                     BOOL delayed = NO;
-                    [inv setArgument:&touchRef atIndex:2];
-                    [inv setArgument:&delayed  atIndex:3];
+                    [inv setArgument:&rawT    atIndex:2];
+                    [inv setArgument:&delayed atIndex:3];
                     [inv invoke];
                 }
-                [app sendEvent:evtRef];
+                [app sendEvent:evt];
             } @catch (NSException *e) {}
         });
     } @catch (NSException *e) {}
