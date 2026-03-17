@@ -1,0 +1,8 @@
+Package: com.borthergusnd.universalautoclicker
+Name: Universal Auto Clicker
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Floating autoclicker - single point and sequence modes
+Maintainer: borthergusnd
+Author: borthergusnd
+Section: Tweaks
