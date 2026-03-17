@@ -32,13 +32,11 @@ typedef IOHIDEventRef (*_IOHIDCreateFingerEvent)(
 
 typedef void (*_IOHIDEventAppend)(IOHIDEventRef, IOHIDEventRef);
 typedef void (*_IOHIDEventSetSenderID)(IOHIDEventRef, uint64_t);
-typedef void (*_IOHIDEventSetIntVal)(IOHIDEventRef, IOHIDEventField, CFIndex);
 
 static _IOHIDCreateDigitizerEvent _createDigitizer = NULL;
 static _IOHIDCreateFingerEvent    _createFinger    = NULL;
 static _IOHIDEventAppend          _appendEvent     = NULL;
 static _IOHIDEventSetSenderID     _setSenderID     = NULL;
-static _IOHIDEventSetIntVal       _setIntVal       = NULL;
 
 static void AC_LoadIOHID(void) {
     static dispatch_once_t once;
@@ -49,7 +47,6 @@ static void AC_LoadIOHID(void) {
         _createFinger    = (_IOHIDCreateFingerEvent)    dlsym(h, "IOHIDEventCreateDigitizerFingerEvent");
         _appendEvent     = (_IOHIDEventAppend)          dlsym(h, "IOHIDEventAppendEvent");
         _setSenderID     = (_IOHIDEventSetSenderID)     dlsym(h, "IOHIDEventSetSenderID");
-        _setIntVal       = (_IOHIDEventSetIntVal)       dlsym(h, "IOHIDEventSetIntegerValue");
     });
 }
 
@@ -111,11 +108,6 @@ static void AC_SendHIDTouch(CGPoint pt, BOOL down) {
         down, down, 0);
     if (!parent) return;
 
-    // Mark as built-in display touch
-    if (_setIntVal) {
-        _setIntVal(parent, kIOHIDEventFieldIsBuiltIn, 1);
-        _setIntVal(parent, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
-    }
     if (_setSenderID) _setSenderID(parent, AC_SENDER_ID);
 
     // Child: finger event
