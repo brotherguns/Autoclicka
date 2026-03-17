@@ -16,18 +16,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install ldid
+        run: brew install ldid xz
+
       - name: Cache Theos
         id: cache-theos
         uses: actions/cache@v4
         with:
           path: ${{ env.THEOS }}
-          key: theos-${{ runner.os }}-v2
+          key: theos-${{ runner.os }}-v3
 
       - name: Install Theos
         if: steps.cache-theos.outputs.cache-hit != 'true'
-        run: |
-          brew install ldid xz
-          git clone --recursive https://github.com/theos/theos.git $THEOS
+        run: git clone --recursive https://github.com/theos/theos.git $THEOS
 
       - name: Download iOS SDK
         if: steps.cache-theos.outputs.cache-hit != 'true'
