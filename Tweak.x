@@ -327,7 +327,7 @@ static void AC_Inject(CGPoint point) {
 @implementation ACPanel
 
 + (instancetype)make {
-    ACPanel *p = [[self alloc] initWithFrame:CGRectMake(15, 80, 215, 272)];
+    ACPanel *p = [[self alloc] initWithFrame:CGRectMake(15, 80, 215, 340)];
     [p buildUI];
     return p;
 }
@@ -502,12 +502,28 @@ static void AC_Inject(CGPoint point) {
 // ---- Actions ----
 
 - (void)onDebug:(UIButton *)btn {
-    AC_CheckSelectors();
-    NSString *captured = _lastDebug;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+    // Show IOKit func load status + bypass selector check
+    BOOL hasDigitizer = (_createDigitizer != NULL);
+    BOOL hasFinger    = (_createFinger != NULL);
+    BOOL hasAppend    = (_appendEvent != NULL);
+    BOOL hasBypass    = [[UIApplication sharedApplication] respondsToSelector:
+                            NSSelectorFromString(@"_handleHIDEventBypassingUIEvent:")];
+    BOOL hasEnqueue   = [[UIApplication sharedApplication] respondsToSelector:
+                            NSSelectorFromString(@"_enqueueHIDEvent:")];
+
+    // Try a test inject and capture result
+    AC_Inject([ACEngine shared].singlePoint);
+
+    NSString *msg = [NSString stringWithFormat:
+        @"IOKit funcs:\ndig=%d fin=%d append=%d\n\nApp selectors:\nbypass=%d enqueue=%d\n\nLast: %@",
+        hasDigitizer, hasFinger, hasAppend,
+        hasBypass, hasEnqueue,
+        _lastDebug];
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
         UIAlertController *alert = [UIAlertController
-            alertControllerWithTitle:@"Selectors"
-            message:captured
+            alertControllerWithTitle:@"AutoClicker Debug"
+            message:[NSString stringWithFormat:@"%@\n\nLast: %@", msg, _lastDebug]
             preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         UIViewController *root = [UIApplication sharedApplication].keyWindow.rootViewController;
@@ -521,7 +537,7 @@ static void AC_Inject(CGPoint point) {
     CGRect f   = self.frame;
     if (isMin) {
         // restore
-        f.size.height = (_modeSeg.selectedSegmentIndex == 1) ? 326 : 272;
+        f.size.height = (_modeSeg.selectedSegmentIndex == 1) ? 400 : 340;
         self.frame = f;
         for (UIView *v in self.subviews)
             if (v.tag != 99) v.hidden = NO;
@@ -565,7 +581,7 @@ static void AC_Inject(CGPoint point) {
     _ptLabel.hidden    = seq;
 
     CGRect f = self.frame;
-    f.size.height = seq ? 326 : 272;
+    f.size.height = seq ? 400 : 340;
     self.frame = f;
 }
 
