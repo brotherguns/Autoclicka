@@ -353,14 +353,14 @@ static void AC_Inject(CGPoint point) {
     y += 42;
 
     // ---- Debug label ----
-    UILabel *dbg = [[UILabel alloc] initWithFrame:CGRectMake(x, y, w, 28)];
+    UILabel *dbg = [[UILabel alloc] initWithFrame:CGRectMake(x, y, w, 44)];
     dbg.tag = 77;
     dbg.text = @"Tap DBG to check selectors";
     dbg.textColor = [UIColor colorWithWhite:0.5 alpha:1];
-    dbg.font = [UIFont systemFontOfSize:8];
-    dbg.numberOfLines = 2;
+    dbg.font = [UIFont systemFontOfSize:7];
+    dbg.numberOfLines = 5;
     [self addSubview:dbg];
-    y += 32;
+    y += 48;
 
     UIButton *dbgBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     dbgBtn.frame = CGRectMake(x, y, w, 22);
@@ -469,11 +469,16 @@ static void AC_Inject(CGPoint point) {
 
 - (void)onDebug:(UIButton *)btn {
     AC_CheckSelectors();
-    // Fire a test inject at current single point
-    AC_Inject([ACEngine shared].singlePoint);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-        UILabel *lbl = (UILabel *)[self viewWithTag:77];
-        lbl.text = _lastDebug;
+    NSString *captured = _lastDebug;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        UIAlertController *alert = [UIAlertController
+            alertControllerWithTitle:@"Selectors"
+            message:captured
+            preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        UIViewController *root = [UIApplication sharedApplication].keyWindow.rootViewController;
+        while (root.presentedViewController) root = root.presentedViewController;
+        [root presentViewController:alert animated:YES completion:nil];
     });
 }
 
