@@ -1,51 +1,68 @@
 // UniversalAutoClicker - Tweak.x
-// Direct UITouch injection with debug logging
+// iOS 26 compatible injection via _handleHIDEventBypassingUIEvent:
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <dlfcn.h>
+#import <mach/mach_time.h>
+#import <IOKit/hid/IOHIDEvent.h>
 
 // ============================================================
-// MARK: - Private API declarations
+// MARK: - IOHIDEvent function pointers
 // ============================================================
 
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wincomplete-implementation"
-#pragma clang diagnostic ignored "-Wobjc-protocol-method-implementation"
+typedef IOHIDEventRef (*_IOHIDCreateDigitizerEvent)(
+    CFAllocatorRef, uint64_t,
+    IOHIDDigitizerTransducerType,
+    uint32_t, uint32_t, IOHIDDigitizerEventMask,
+    uint32_t,
+    IOHIDFloat, IOHIDFloat, IOHIDFloat,
+    IOHIDFloat, IOHIDFloat,
+    IOHIDFloat, IOHIDFloat,
+    Boolean, Boolean, IOHIDEventOptionBits);
 
-@interface UITouch (AC)
-- (id)initAtPoint:(CGPoint)point inWindow:(UIWindow *)window;
-- (void)_setPhase:(UITouchPhase)phase;
-- (void)_setTimestamp:(NSTimeInterval)timestamp;
-- (void)_setView:(UIView *)view;
-- (void)_setTapCount:(NSUInteger)tapCount;
-- (void)_setHIDEvent:(CFTypeRef)event;
-@end
+typedef IOHIDEventRef (*_IOHIDCreateFingerEvent)(
+    CFAllocatorRef, uint64_t,
+    uint32_t, uint32_t, IOHIDDigitizerEventMask,
+    IOHIDFloat, IOHIDFloat, IOHIDFloat,
+    IOHIDFloat, IOHIDFloat,
+    IOHIDFloat, IOHIDFloat,
+    Boolean, Boolean, IOHIDEventOptionBits);
 
-@interface UIEvent (AC)
-- (void)_clearTouches;
-- (void)_addTouch:(UITouch *)touch forDelayedDelivery:(BOOL)delayed;
-@end
+typedef void (*_IOHIDEventAppend)(IOHIDEventRef, IOHIDEventRef);
+typedef void (*_IOHIDEventSetSenderID)(IOHIDEventRef, uint64_t);
 
-@interface UIApplication (AC)
-- (UIEvent *)_touchesEvent;
-@end
+static _IOHIDCreateDigitizerEvent  _createDigitizer = NULL;
+static _IOHIDCreateFingerEvent     _createFinger    = NULL;
+static _IOHIDEventAppend           _appendEvent     = NULL;
+static _IOHIDEventSetSenderID      _setSenderID     = NULL;
 
-#pragma clang diagnostic pop
+static void AC_LoadIOHID(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+        if (!h) return;
+        _createDigitizer = (_IOHIDCreateDigitizerEvent) dlsym(h, "IOHIDEventCreateDigitizerEvent");
+        _createFinger    = (_IOHIDCreateFingerEvent)    dlsym(h, "IOHIDEventCreateDigitizerFingerEvent");
+        _appendEvent     = (_IOHIDEventAppend)          dlsym(h, "IOHIDEventAppendEvent");
+        _setSenderID     = (_IOHIDEventSetSenderID)     dlsym(h, "IOHIDEventSetSenderID");
+    });
+}
+
+#define AC_SENDER_ID 0x8000000817319375ULL
 
 // ============================================================
 // MARK: - Debug
 // ============================================================
 
 static NSString *_lastDebug = @"No inject yet";
-
 static void AC_Debug(NSString *msg) {
     _lastDebug = msg;
     NSLog(@"[AutoClicker] %@", msg);
 }
 
 static void AC_CheckSelectors(void) {
-    // Dump all UITouch instance methods containing "init" or "point" or "hid" or "phase"
     NSMutableString *out = [NSMutableString string];
     unsigned int count = 0;
     Method *methods = class_copyMethodList([UITouch class], &count);
@@ -60,8 +77,6 @@ static void AC_CheckSelectors(void) {
         }
     }
     free(methods);
-
-    // Also check UIApplication for touch event selectors
     [out appendString:@"---UIApp---\n"];
     Method *appMethods = class_copyMethodList([UIApplication class], &count);
     for (unsigned int i = 0; i < count; i++) {
@@ -73,16 +88,10 @@ static void AC_CheckSelectors(void) {
         }
     }
     free(appMethods);
-
     AC_Debug(out);
-    // Write to app's own Documents directory
     NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    NSString *docs = [paths firstObject];
-    NSString *path = [docs stringByAppendingPathComponent:@"ac_debug.txt"];
-    NSError *err;
-    [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
-    NSLog(@"[AutoClicker] Debug file: %@ err=%@", path, err);
-    // Also show path on label
+    NSString *path = [[paths firstObject] stringByAppendingPathComponent:@"ac_debug.txt"];
+    [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     _lastDebug = [NSString stringWithFormat:@"Saved to:\n%@", path];
 }
 
@@ -90,76 +99,101 @@ static void AC_CheckSelectors(void) {
 // MARK: - Injection
 // ============================================================
 
+static IOHIDEventRef AC_MakeEvent(CGPoint pt, BOOL down) {
+    if (!_createDigitizer || !_createFinger || !_appendEvent) return NULL;
+
+    CGRect bounds = [UIScreen mainScreen].bounds;
+    IOHIDFloat xf = pt.x / bounds.size.width;
+    IOHIDFloat yf = pt.y / bounds.size.height;
+    uint64_t ts = mach_absolute_time();
+
+    uint32_t parentFlags, childFlags;
+    if (down) {
+        parentFlags = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventIdentity;
+        childFlags  = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch;
+    } else {
+        parentFlags = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch |
+                      kIOHIDDigitizerEventIdentity | kIOHIDDigitizerEventPosition;
+        childFlags  = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch;
+    }
+
+    IOHIDEventRef parent = _createDigitizer(
+        kCFAllocatorDefault, ts,
+        kIOHIDDigitizerTransducerTypeHand,
+        1 << 22, 1, parentFlags, 0,
+        xf, yf, 0, 0, 0, 0, 0,
+        down, down, 0);
+    if (!parent) return NULL;
+
+    if (_setSenderID) _setSenderID(parent, AC_SENDER_ID);
+
+    IOHIDEventRef child = _createFinger(
+        kCFAllocatorDefault, ts,
+        3, 2, childFlags,
+        xf, yf, 0,
+        down ? 1.0 : 0.0, 0,
+        5, 5,
+        down, down, 0);
+    if (child) {
+        _appendEvent(parent, child);
+        CFRelease(child);
+    }
+    return parent;
+}
+
 static void AC_Inject(CGPoint point) {
     @try {
         UIApplication *app = [UIApplication sharedApplication];
         if (!app) { AC_Debug(@"FAIL: no app"); return; }
 
-        UIWindow *win = nil;
-        for (UIWindow *w in [app valueForKey:@"windows"] ?: @[]) {
-            if (w.isHidden || w.alpha <= 0) continue;
-            if ([NSStringFromClass([w class]) isEqualToString:@"ACOverlayWindow"]) continue;
-            if (!win || w.windowLevel > win.windowLevel) win = w;
-        }
-        if (!win) { AC_Debug(@"FAIL: no window"); return; }
+        // _handleHIDEventBypassingUIEvent: confirmed present on iOS 26 from debug dump
+        SEL bypassSel = NSSelectorFromString(@"_handleHIDEventBypassingUIEvent:");
+        SEL enqueueSel = NSSelectorFromString(@"_enqueueHIDEvent:");
 
-        UIView *hitView = [win hitTest:point withEvent:nil] ?: win;
-        AC_Debug([NSString stringWithFormat:@"Injecting at (%.0f,%.0f) into %@", point.x, point.y, NSStringFromClass([hitView class])]);
+        IOHIDEventRef downEvt = AC_MakeEvent(point, YES);
+        if (!downEvt) { AC_Debug(@"FAIL: could not create HID event - IOKit funcs missing"); return; }
 
-        // Method 1: UITouch + sendEvent:
-        SEL initSel = NSSelectorFromString(@"initAtPoint:inWindow:");
-        SEL evtSel  = NSSelectorFromString(@"_touchesEvent");
-
-        if ([UITouch instancesRespondToSelector:initSel] && [app respondsToSelector:evtSel]) {
-            UITouch *touch = [[UITouch alloc] initAtPoint:point inWindow:win];
-            if (touch) {
-                [touch _setPhase:UITouchPhaseBegan];
-                [touch _setTimestamp:[NSProcessInfo processInfo].systemUptime];
-                [touch _setView:hitView];
-                [touch _setTapCount:1];
-
-                UIEvent *event = [app _touchesEvent];
-                if (event) {
-                    [event _clearTouches];
-                    [event _addTouch:touch forDelayedDelivery:NO];
-                    [app sendEvent:event];
-                    AC_Debug([NSString stringWithFormat:@"sendEvent OK - view: %@", NSStringFromClass([hitView class])]);
-
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC),
-                                   dispatch_get_main_queue(), ^{
-                        @try {
-                            [touch _setPhase:UITouchPhaseEnded];
-                            [touch _setTimestamp:[NSProcessInfo processInfo].systemUptime];
-                            [event _clearTouches];
-                            [event _addTouch:touch forDelayedDelivery:NO];
-                            [app sendEvent:event];
-                        } @catch (...) {}
-                    });
-                    return;
-                } else {
-                    AC_Debug(@"FAIL: _touchesEvent returned nil");
-                }
-            } else {
-                AC_Debug(@"FAIL: UITouch alloc/init returned nil");
-            }
+        if ([app respondsToSelector:bypassSel]) {
+            NSMethodSignature *sig = [app methodSignatureForSelector:bypassSel];
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            inv.target = app; inv.selector = bypassSel;
+            [inv setArgument:&downEvt atIndex:2];
+            [inv invoke];
+            AC_Debug([NSString stringWithFormat:@"_handleHIDEventBypassingUIEvent: called at (%.0f,%.0f)", point.x, point.y]);
+        } else if ([app respondsToSelector:enqueueSel]) {
+            NSMethodSignature *sig = [app methodSignatureForSelector:enqueueSel];
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            inv.target = app; inv.selector = enqueueSel;
+            [inv setArgument:&downEvt atIndex:2];
+            [inv invoke];
+            AC_Debug(@"_enqueueHIDEvent: used as fallback");
         } else {
-            AC_Debug([NSString stringWithFormat:@"FAIL: missing selectors initAtPoint=%d _touchesEvent=%d",
-                [UITouch instancesRespondToSelector:initSel],
-                [app respondsToSelector:evtSel]]);
+            AC_Debug(@"FAIL: neither bypass nor enqueue available");
         }
+        CFRelease(downEvt);
 
-        // Method 2: Direct touchesBegan fallback
-        AC_Debug(@"Trying direct touchesBegan fallback");
-        UITouch *t2 = [[UITouch alloc] init];
-        if (t2) {
-            NSSet *set = [NSSet setWithObject:t2];
-            [hitView touchesBegan:set withEvent:nil];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC),
-                           dispatch_get_main_queue(), ^{
-                @try { [hitView touchesEnded:set withEvent:nil]; } @catch(...) {}
-            });
-        }
-    } @catch (NSException *e) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                IOHIDEventRef upEvt = AC_MakeEvent(point, NO);
+                if (!upEvt) return;
+                if ([app respondsToSelector:bypassSel]) {
+                    NSMethodSignature *sig = [app methodSignatureForSelector:bypassSel];
+                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                    inv.target = app; inv.selector = bypassSel;
+                    [inv setArgument:&upEvt atIndex:2];
+                    [inv invoke];
+                } else if ([app respondsToSelector:enqueueSel]) {
+                    NSMethodSignature *sig = [app methodSignatureForSelector:enqueueSel];
+                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                    inv.target = app; inv.selector = enqueueSel;
+                    [inv setArgument:&upEvt atIndex:2];
+                    [inv invoke];
+                }
+                CFRelease(upEvt);
+            } @catch(...) {}
+        });
+    } @catch(NSException *e) {
         AC_Debug([NSString stringWithFormat:@"EXCEPTION: %@", e]);
     }
 }
@@ -718,6 +752,7 @@ static void AC_Inject(CGPoint point) {
 // ============================================================
 
 %ctor {
+    AC_LoadIOHID();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         [[ACManager shared] setup];
