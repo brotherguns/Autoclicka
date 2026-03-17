@@ -1,39 +1,55 @@
 // UniversalAutoClicker - Tweak.x
-// Floating panel UI, single-point + multi-point sequence modes
-// Hybrid injection: IOHIDEvent attached to UITouch via _setHIDEvent: (reverse engineered from working dylib)
+// Hybrid injection: parent hand event + child finger event (from hid-support / reverse engineering)
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import <mach/mach_time.h>
+#import <IOKit/hid/IOHIDEvent.h>
 
 // ============================================================
-// MARK: - IOHIDEvent
+// MARK: - IOHIDEvent helpers (loaded at runtime)
 // ============================================================
 
-typedef CFTypeRef IOHIDEventRef;
-
-#define kIOHIDDigitizerEventTouch    (1 << 0)
-#define kIOHIDDigitizerEventRange    (1 << 1)
-#define kIOHIDDigitizerEventPosition (1 << 2)
-
-typedef IOHIDEventRef (*_IOHIDEventCreateDigitizerFingerEvent)(
+typedef IOHIDEventRef (*_IOHIDCreateDigitizerEvent)(
     CFAllocatorRef, uint64_t,
-    uint32_t, uint32_t, uint32_t,
-    double, double, double,
-    double, double, double, double,
-    bool, bool, uint32_t
-);
+    IOHIDDigitizerTransducerType,
+    uint32_t, uint32_t, IOHIDDigitizerEventMask,
+    uint32_t,
+    IOHIDFloat, IOHIDFloat, IOHIDFloat,
+    IOHIDFloat, IOHIDFloat,
+    IOHIDFloat, IOHIDFloat,
+    Boolean, Boolean, IOHIDEventOptionBits);
 
-static _IOHIDEventCreateDigitizerFingerEvent _createFinger = NULL;
+typedef IOHIDEventRef (*_IOHIDCreateFingerEvent)(
+    CFAllocatorRef, uint64_t,
+    uint32_t, uint32_t, IOHIDDigitizerEventMask,
+    IOHIDFloat, IOHIDFloat, IOHIDFloat,
+    IOHIDFloat, IOHIDFloat,
+    IOHIDFloat, IOHIDFloat,
+    Boolean, Boolean, IOHIDEventOptionBits);
+
+typedef void (*_IOHIDEventAppend)(IOHIDEventRef, IOHIDEventRef);
+typedef void (*_IOHIDEventSetSenderID)(IOHIDEventRef, uint64_t);
+typedef void (*_IOHIDEventSetIntVal)(IOHIDEventRef, IOHIDEventField, CFIndex);
+
+static _IOHIDCreateDigitizerEvent _createDigitizer = NULL;
+static _IOHIDCreateFingerEvent    _createFinger    = NULL;
+static _IOHIDEventAppend          _appendEvent     = NULL;
+static _IOHIDEventSetSenderID     _setSenderID     = NULL;
+static _IOHIDEventSetIntVal       _setIntVal       = NULL;
 
 static void AC_LoadIOHID(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
-        if (h) _createFinger = (_IOHIDEventCreateDigitizerFingerEvent)
-            dlsym(h, "IOHIDEventCreateDigitizerFingerEvent");
+        if (!h) return;
+        _createDigitizer = (_IOHIDCreateDigitizerEvent) dlsym(h, "IOHIDEventCreateDigitizerEvent");
+        _createFinger    = (_IOHIDCreateFingerEvent)    dlsym(h, "IOHIDEventCreateDigitizerFingerEvent");
+        _appendEvent     = (_IOHIDEventAppend)          dlsym(h, "IOHIDEventAppendEvent");
+        _setSenderID     = (_IOHIDEventSetSenderID)     dlsym(h, "IOHIDEventSetSenderID");
+        _setIntVal       = (_IOHIDEventSetIntVal)       dlsym(h, "IOHIDEventSetIntegerValue");
     });
 }
 
@@ -41,19 +57,15 @@ static void AC_LoadIOHID(void) {
 // MARK: - Injection
 // ============================================================
 
-static IOHIDEventRef AC_MakeHIDEvent(CGPoint pt, bool down) {
-    if (!_createFinger) return NULL;
-    uint32_t mask = kIOHIDDigitizerEventPosition;
-    if (down) mask |= (kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventRange);
-    // IOHIDEventCreateDigitizerFingerEvent expects actual point coords (not normalized, not pixels)
-    return _createFinger(
-        kCFAllocatorDefault, mach_absolute_time(),
-        1, 1, mask,
-        pt.x, pt.y, 0,          // x, y in UIKit points
-        down ? 1.0 : 0.0, 0,    // pressure, twist
-        5, 5,                    // minor/major radius
-        down, down, 0
-    );
+static void AC_EnqueueHIDEvent(IOHIDEventRef evt) {
+    UIApplication *app = [UIApplication sharedApplication];
+    SEL sel = NSSelectorFromString(@"_enqueueHIDEvent:");
+    if (![app respondsToSelector:sel]) return;
+    NSMethodSignature *sig = [app methodSignatureForSelector:sel];
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    inv.target = app; inv.selector = sel;
+    [inv setArgument:&evt atIndex:2];
+    [inv invoke];
 }
 
 static void AC_InvokeVoid(id obj, SEL sel) {
@@ -63,190 +75,74 @@ static void AC_InvokeVoid(id obj, SEL sel) {
     inv.target = obj; inv.selector = sel; [inv invoke];
 }
 
+// Sender ID observed in real touch events on iOS 7+
+#define AC_SENDER_ID 0x8000000817319375ULL
+
+static void AC_SendHIDTouch(CGPoint pt, BOOL down) {
+    if (!_createDigitizer || !_createFinger || !_appendEvent) return;
+
+    CGRect bounds = [UIScreen mainScreen].bounds;
+    IOHIDFloat xf = pt.x / bounds.size.width;
+    IOHIDFloat yf = pt.y / bounds.size.height;
+    uint64_t ts = mach_absolute_time();
+
+    // Flags match what hid-support uses for down/up
+    uint32_t parentFlags, childFlags;
+    if (down) {
+        parentFlags = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventIdentity;
+        childFlags  = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch;
+    } else {
+        parentFlags = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch |
+                      kIOHIDDigitizerEventIdentity | kIOHIDDigitizerEventPosition;
+        childFlags  = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch;
+    }
+
+    // Parent: hand-type digitizer event
+    IOHIDEventRef parent = _createDigitizer(
+        kCFAllocatorDefault, ts,
+        kIOHIDDigitizerTransducerTypeHand,
+        1 << 22,   // collection id
+        1,         // child count
+        parentFlags,
+        0,         // options
+        xf, yf, 0,
+        0, 0,
+        0, 0,
+        down, down, 0);
+    if (!parent) return;
+
+    // Mark as built-in display touch
+    if (_setIntVal) {
+        _setIntVal(parent, kIOHIDEventFieldIsBuiltIn, 1);
+        _setIntVal(parent, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
+    }
+    if (_setSenderID) _setSenderID(parent, AC_SENDER_ID);
+
+    // Child: finger event
+    IOHIDEventRef child = _createFinger(
+        kCFAllocatorDefault, ts,
+        3, 2,       // index, identity
+        childFlags,
+        xf, yf, 0,
+        down ? 1.0 : 0.0, 0,
+        5, 5,
+        down, down, 0);
+
+    if (child) {
+        _appendEvent(parent, child);
+        CFRelease(child);
+    }
+
+    AC_EnqueueHIDEvent(parent);
+    CFRelease(parent);
+}
+
 static void AC_Inject(CGPoint point) {
     @try {
-        UIApplication *app = [UIApplication sharedApplication];
-        if (!app) return;
-
-        // Find target window
-        UIWindow *win = nil;
-        for (UIWindow *w in [app valueForKey:@"windows"] ?: @[]) {
-            if (w.isHidden || w.alpha <= 0) continue;
-            if ([NSStringFromClass([w class]) isEqualToString:@"ACOverlayWindow"]) continue;
-            if (!win || w.windowLevel > win.windowLevel) win = w;
-        }
-        if (!win) return;
-
-        UIView *hitView = [win hitTest:point withEvent:nil] ?: win;
-
-        // Build IOHIDEvent (makes games register the touch as real hardware input)
-        IOHIDEventRef hidEvt = AC_MakeHIDEvent(point, true);
-
-        // Build UITouch and attach the IOHIDEvent to it (_setHIDEvent: is the key)
-        SEL initSel    = NSSelectorFromString(@"initAtPoint:inWindow:");
-        SEL hidSel     = NSSelectorFromString(@"_setHIDEvent:");
-        SEL phaseSel   = NSSelectorFromString(@"_setPhase:");
-        SEL tsSel      = NSSelectorFromString(@"_setTimestamp:");
-        SEL viewSel    = NSSelectorFromString(@"_setView:");
-        SEL tapSel     = NSSelectorFromString(@"_setTapCount:");
-        SEL evtSel     = NSSelectorFromString(@"_touchesEvent");
-        SEL clrSel     = NSSelectorFromString(@"_clearTouches");
-        SEL addSel     = NSSelectorFromString(@"_addTouch:forDelayedDelivery:");
-
-        if (![UITouch instancesRespondToSelector:initSel]) {
-            // Fallback: enqueue raw HID event only
-            if (hidEvt) {
-                SEL eq = NSSelectorFromString(@"_enqueueHIDEvent:");
-                if ([app respondsToSelector:eq]) {
-                    NSMethodSignature *sig = [app methodSignatureForSelector:eq];
-                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                    inv.target = app; inv.selector = eq;
-                    [inv setArgument:&hidEvt atIndex:2]; [inv invoke];
-                }
-                CFRelease(hidEvt);
-            }
-            return;
-        }
-
-        // Init UITouch
-        __unsafe_unretained UITouch *rawTouch = nil;
-        {
-            NSMethodSignature *sig = [UITouch instanceMethodSignatureForSelector:initSel];
-            if (!sig) return;
-            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            UITouch *alloc = [UITouch alloc];
-            inv.target = alloc; inv.selector = initSel;
-            [inv setArgument:&point atIndex:2];
-            [inv setArgument:&win   atIndex:3];
-            [inv invoke];
-            [inv getReturnValue:&rawTouch];
-        }
-        UITouch *touch = rawTouch;
-        if (!touch) { if (hidEvt) CFRelease(hidEvt); return; }
-
-        // Attach IOHIDEvent to UITouch — this is what makes games see it
-        if (hidEvt && [touch respondsToSelector:hidSel]) {
-            NSMethodSignature *sig = [touch methodSignatureForSelector:hidSel];
-            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            inv.target = touch; inv.selector = hidSel;
-            [inv setArgument:&hidEvt atIndex:2]; [inv invoke];
-        }
-
-        NSTimeInterval ts = [NSProcessInfo processInfo].systemUptime;
-        UITouchPhase began = UITouchPhaseBegan;
-        NSUInteger tapCount = 1;
-
-        if ([touch respondsToSelector:phaseSel]) {
-            NSMethodSignature *sig = [touch methodSignatureForSelector:phaseSel];
-            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            inv.target = touch; inv.selector = phaseSel;
-            [inv setArgument:&began atIndex:2]; [inv invoke];
-        }
-        if ([touch respondsToSelector:tsSel]) {
-            NSMethodSignature *sig = [touch methodSignatureForSelector:tsSel];
-            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            inv.target = touch; inv.selector = tsSel;
-            [inv setArgument:&ts atIndex:2]; [inv invoke];
-        }
-        if ([touch respondsToSelector:viewSel]) {
-            NSMethodSignature *sig = [touch methodSignatureForSelector:viewSel];
-            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            inv.target = touch; inv.selector = viewSel;
-            __unsafe_unretained UIView *rv = hitView;
-            [inv setArgument:&rv atIndex:2]; [inv invoke];
-        }
-        if ([touch respondsToSelector:tapSel]) {
-            NSMethodSignature *sig = [touch methodSignatureForSelector:tapSel];
-            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            inv.target = touch; inv.selector = tapSel;
-            [inv setArgument:&tapCount atIndex:2]; [inv invoke];
-        }
-
-        // Get UIEvent and inject
-        __unsafe_unretained UIEvent *rawEvt = nil;
-        if ([app respondsToSelector:evtSel]) {
-            NSMethodSignature *sig = [app methodSignatureForSelector:evtSel];
-            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            inv.target = app; inv.selector = evtSel;
-            [inv invoke]; [inv getReturnValue:&rawEvt];
-        }
-        UIEvent *evt = rawEvt;
-        if (evt) {
-            if ([evt respondsToSelector:clrSel]) AC_InvokeVoid(evt, clrSel);
-            if ([evt respondsToSelector:addSel]) {
-                NSMethodSignature *sig = [evt methodSignatureForSelector:addSel];
-                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                inv.target = evt; inv.selector = addSel;
-                __unsafe_unretained UITouch *rawT = touch;
-                BOOL delayed = NO;
-                [inv setArgument:&rawT    atIndex:2];
-                [inv setArgument:&delayed atIndex:3];
-                [inv invoke];
-            }
-            [app sendEvent:evt];
-        }
-
-        // Also enqueue raw HID event — games that bypass UIKit pick this up
-        SEL enqueueSel = NSSelectorFromString(@"_enqueueHIDEvent:");
-        if (hidEvt && [app respondsToSelector:enqueueSel]) {
-            NSMethodSignature *sig = [app methodSignatureForSelector:enqueueSel];
-            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            inv.target = app; inv.selector = enqueueSel;
-            [inv setArgument:&hidEvt atIndex:2];
-            [inv invoke];
-        }
-        if (hidEvt) CFRelease(hidEvt);
-
-        // End touch after 80ms
+        AC_SendHIDTouch(point, YES);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
-            @try {
-                IOHIDEventRef hidEnd = AC_MakeHIDEvent(point, false);
-                NSTimeInterval ts2 = [NSProcessInfo processInfo].systemUptime;
-                UITouchPhase ended = UITouchPhaseEnded;
-
-                if ([touch respondsToSelector:hidSel] && hidEnd) {
-                    NSMethodSignature *sig = [touch methodSignatureForSelector:hidSel];
-                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                    inv.target = touch; inv.selector = hidSel;
-                    [inv setArgument:&hidEnd atIndex:2]; [inv invoke];
-                }
-                if ([touch respondsToSelector:phaseSel]) {
-                    NSMethodSignature *sig = [touch methodSignatureForSelector:phaseSel];
-                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                    inv.target = touch; inv.selector = phaseSel;
-                    [inv setArgument:&ended atIndex:2]; [inv invoke];
-                }
-                if ([touch respondsToSelector:tsSel]) {
-                    NSMethodSignature *sig = [touch methodSignatureForSelector:tsSel];
-                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                    inv.target = touch; inv.selector = tsSel;
-                    [inv setArgument:&ts2 atIndex:2]; [inv invoke];
-                }
-                if (evt) {
-                    if ([evt respondsToSelector:clrSel]) AC_InvokeVoid(evt, clrSel);
-                    if ([evt respondsToSelector:addSel]) {
-                        NSMethodSignature *sig = [evt methodSignatureForSelector:addSel];
-                        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                        inv.target = evt; inv.selector = addSel;
-                        __unsafe_unretained UITouch *rawT = touch;
-                        BOOL delayed = NO;
-                        [inv setArgument:&rawT    atIndex:2];
-                        [inv setArgument:&delayed atIndex:3];
-                        [inv invoke];
-                    }
-                    [app sendEvent:evt];
-                }
-                SEL enqueueSel = NSSelectorFromString(@"_enqueueHIDEvent:");
-                if (hidEnd && [app respondsToSelector:enqueueSel]) {
-                    NSMethodSignature *sig = [app methodSignatureForSelector:enqueueSel];
-                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                    inv.target = app; inv.selector = enqueueSel;
-                    [inv setArgument:&hidEnd atIndex:2];
-                    [inv invoke];
-                }
-                if (hidEnd) CFRelease(hidEnd);
-            } @catch(...) {}
+            @try { AC_SendHIDTouch(point, NO); } @catch(...) {}
         });
     } @catch(...) {}
 }
