@@ -33,7 +33,8 @@ static void AC_Tap(CGPoint pt) {
         if ([UITouch instancesRespondToSelector:initSel]) {
             NSMethodSignature *sig = [UITouch instanceMethodSignatureForSelector:initSel];
             NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            inv.target = [UITouch alloc]; inv.selector = initSel;
+            UITouch *alloc = [UITouch alloc];
+            inv.target = alloc; inv.selector = initSel;
             [inv setArgument:&pt  atIndex:2];
             [inv setArgument:&win atIndex:3];
             [inv invoke];
