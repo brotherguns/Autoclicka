@@ -1,5 +1,5 @@
 // UniversalAutoClicker - Tweak.x
-// Hybrid injection: parent hand event + child finger event (from hid-support / reverse engineering)
+// Hybrid injection: IOHIDEventSystemClientDispatchEvent (hardware-level, works in games)
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -9,8 +9,10 @@
 #import <IOKit/hid/IOHIDEvent.h>
 
 // ============================================================
-// MARK: - IOHIDEvent helpers (loaded at runtime)
+// MARK: - IOHIDEvent function pointers
 // ============================================================
+
+typedef CFTypeRef IOHIDEventSystemClientRef;
 
 typedef IOHIDEventRef (*_IOHIDCreateDigitizerEvent)(
     CFAllocatorRef, uint64_t,
@@ -30,23 +32,32 @@ typedef IOHIDEventRef (*_IOHIDCreateFingerEvent)(
     IOHIDFloat, IOHIDFloat,
     Boolean, Boolean, IOHIDEventOptionBits);
 
-typedef void (*_IOHIDEventAppend)(IOHIDEventRef, IOHIDEventRef);
-typedef void (*_IOHIDEventSetSenderID)(IOHIDEventRef, uint64_t);
+typedef void     (*_IOHIDEventAppend)(IOHIDEventRef, IOHIDEventRef);
+typedef void     (*_IOHIDEventSetSenderID)(IOHIDEventRef, uint64_t);
+typedef CFTypeRef(*_IOHIDSysClientCreate)(CFAllocatorRef);
+typedef void     (*_IOHIDSysClientDispatch)(IOHIDEventSystemClientRef, IOHIDEventRef);
 
-static _IOHIDCreateDigitizerEvent _createDigitizer = NULL;
-static _IOHIDCreateFingerEvent    _createFinger    = NULL;
-static _IOHIDEventAppend          _appendEvent     = NULL;
-static _IOHIDEventSetSenderID     _setSenderID     = NULL;
+static _IOHIDCreateDigitizerEvent  _createDigitizer  = NULL;
+static _IOHIDCreateFingerEvent     _createFinger     = NULL;
+static _IOHIDEventAppend           _appendEvent      = NULL;
+static _IOHIDEventSetSenderID      _setSenderID      = NULL;
+static _IOHIDSysClientCreate       _sysClientCreate  = NULL;
+static _IOHIDSysClientDispatch     _sysClientDispatch = NULL;
+static IOHIDEventSystemClientRef   _sysClient        = NULL;
 
 static void AC_LoadIOHID(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
         if (!h) return;
-        _createDigitizer = (_IOHIDCreateDigitizerEvent) dlsym(h, "IOHIDEventCreateDigitizerEvent");
-        _createFinger    = (_IOHIDCreateFingerEvent)    dlsym(h, "IOHIDEventCreateDigitizerFingerEvent");
-        _appendEvent     = (_IOHIDEventAppend)          dlsym(h, "IOHIDEventAppendEvent");
-        _setSenderID     = (_IOHIDEventSetSenderID)     dlsym(h, "IOHIDEventSetSenderID");
+        _createDigitizer   = (_IOHIDCreateDigitizerEvent) dlsym(h, "IOHIDEventCreateDigitizerEvent");
+        _createFinger      = (_IOHIDCreateFingerEvent)    dlsym(h, "IOHIDEventCreateDigitizerFingerEvent");
+        _appendEvent       = (_IOHIDEventAppend)          dlsym(h, "IOHIDEventAppendEvent");
+        _setSenderID       = (_IOHIDEventSetSenderID)     dlsym(h, "IOHIDEventSetSenderID");
+        _sysClientCreate   = (_IOHIDSysClientCreate)      dlsym(h, "IOHIDEventSystemClientCreate");
+        _sysClientDispatch = (_IOHIDSysClientDispatch)    dlsym(h, "IOHIDEventSystemClientDispatchEvent");
+        if (_sysClientCreate)
+            _sysClient = _sysClientCreate(kCFAllocatorDefault);
     });
 }
 
@@ -54,30 +65,17 @@ static void AC_LoadIOHID(void) {
 // MARK: - Injection
 // ============================================================
 
-static void AC_EnqueueHIDEvent(IOHIDEventRef evt) {
-    UIApplication *app = [UIApplication sharedApplication];
-    SEL sel = NSSelectorFromString(@"_enqueueHIDEvent:");
-    if (![app respondsToSelector:sel]) return;
-    NSMethodSignature *sig = [app methodSignatureForSelector:sel];
-    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-    inv.target = app; inv.selector = sel;
-    [inv setArgument:&evt atIndex:2];
-    [inv invoke];
-}
-
-
-// Sender ID observed in real touch events on iOS 7+
 #define AC_SENDER_ID 0x8000000817319375ULL
 
 static void AC_SendHIDTouch(CGPoint pt, BOOL down) {
     if (!_createDigitizer || !_createFinger || !_appendEvent) return;
+    if (!_sysClientDispatch || !_sysClient) return;
 
     CGRect bounds = [UIScreen mainScreen].bounds;
     IOHIDFloat xf = pt.x / bounds.size.width;
     IOHIDFloat yf = pt.y / bounds.size.height;
     uint64_t ts = mach_absolute_time();
 
-    // Flags match what hid-support uses for down/up
     uint32_t parentFlags, childFlags;
     if (down) {
         parentFlags = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventIdentity;
@@ -88,27 +86,19 @@ static void AC_SendHIDTouch(CGPoint pt, BOOL down) {
         childFlags  = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch;
     }
 
-    // Parent: hand-type digitizer event
     IOHIDEventRef parent = _createDigitizer(
         kCFAllocatorDefault, ts,
         kIOHIDDigitizerTransducerTypeHand,
-        1 << 22,   // collection id
-        1,         // child count
-        parentFlags,
-        0,         // options
-        xf, yf, 0,
-        0, 0,
-        0, 0,
+        1 << 22, 1, parentFlags, 0,
+        xf, yf, 0, 0, 0, 0, 0,
         down, down, 0);
     if (!parent) return;
 
     if (_setSenderID) _setSenderID(parent, AC_SENDER_ID);
 
-    // Child: finger event
     IOHIDEventRef child = _createFinger(
         kCFAllocatorDefault, ts,
-        3, 2,       // index, identity
-        childFlags,
+        3, 2, childFlags,
         xf, yf, 0,
         down ? 1.0 : 0.0, 0,
         5, 5,
@@ -119,7 +109,8 @@ static void AC_SendHIDTouch(CGPoint pt, BOOL down) {
         CFRelease(child);
     }
 
-    AC_EnqueueHIDEvent(parent);
+    // Dispatch through IOHIDEventSystemClient — hardware-level path, works in all apps/games
+    _sysClientDispatch(_sysClient, parent);
     CFRelease(parent);
 }
 
