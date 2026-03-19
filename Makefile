@@ -11,17 +11,3 @@ CodUnlock_LIBRARIES = dobby
 CodUnlock_CFLAGS = -fobjc-arc
 
 include $(THEOS)/makefiles/tweak.mk
-```
-
----
-
-**`control`** — update name/package:
-```
-Package: com.brotherguns.codunlock
-Name: CodUnlock
-Version: 1.0
-Architecture: iphoneos-arm64
-Description: CoD Mobile loadout unlock tweak
-Maintainer: brotherguns
-Author: brotherguns
-Section: Tweaks
