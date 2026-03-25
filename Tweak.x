@@ -74,11 +74,6 @@ static void dumpToFile(NSString *entry) {
 
 // ── WKScriptMessageHandler — log messages coming FROM the WebView TO Swift ────
 
-@interface WKScriptMessage : NSObject
-@property (nonatomic, readonly, copy) NSString *name;
-@property (nonatomic, readonly, copy) id body;
-@end
-
 %hook NSObject
 
 - (void)userContentController:(WKUserContentController *)controller
