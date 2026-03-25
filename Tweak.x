@@ -2,72 +2,56 @@
 #import <Foundation/Foundation.h>
 #import <WebKit/WebKit.h>
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Logger ───────────────────────────────────────────────────────────────────
 
-static id patchJSON(id obj) {
-    if ([obj isKindOfClass:[NSDictionary class]]) {
-        NSMutableDictionary *d = [((NSDictionary *)obj) mutableCopy];
-        // Patch subscription/premium fields
-        if (d[@"isSubscribed"] != nil)  d[@"isSubscribed"]  = @YES;
-        if (d[@"isPremium"] != nil)     d[@"isPremium"]     = @YES;
-        if (d[@"premium"] != nil)       d[@"premium"]       = @YES;
-        if (d[@"subscribed"] != nil)    d[@"subscribed"]    = @YES;
-        if (d[@"credits"] != nil)       d[@"credits"]       = @99999;
-        if (d[@"redeemPrice"] != nil)   d[@"redeemPrice"]   = @0;
-        for (NSString *key in [d allKeys]) {
-            d[key] = patchJSON(d[key]);
-        }
-        return [d copy];
-    } else if ([obj isKindOfClass:[NSArray class]]) {
-        NSMutableArray *a = [((NSArray *)obj) mutableCopy];
-        for (NSUInteger i = 0; i < a.count; i++) {
-            a[i] = patchJSON(a[i]);
-        }
-        return [a copy];
+static void dumpToFile(NSString *entry) {
+    NSString *path = @"/var/mobile/Documents/unlockr_dump.txt";
+    NSString *line = [NSString stringWithFormat:@"%@\n---\n", entry];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) {
+        [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:path];
     }
-    return obj;
+    [fh seekToEndOfFile];
+    [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+    [fh closeFile];
 }
 
-// ── NSJSONSerialization — patches all parsed JSON ────────────────────────────
-
-%hook NSJSONSerialization
-
-+ (id)JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError **)error {
-    id result = %orig(data, opt, error);
-    if (result) result = patchJSON(result);
-    return result;
-}
-
-%end
-
-
-// ── NSURLSession — patch responses from the unlockr server ───────────────────
-// Catches the async server response before NSJSONSerialization even runs,
-// in case the app uses a streaming/manual JSON parse path.
+// ── NSURLSession — log ALL requests and responses ────────────────────────────
 
 %hook NSURLSession
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+    NSString *url = request.URL.absoluteString;
+    NSString *method = request.HTTPMethod ?: @"GET";
+    NSString *reqBody = @"(none)";
+    if (request.HTTPBody) {
+        reqBody = [[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding] ?: @"(binary)";
+    }
+
+    dumpToFile([NSString stringWithFormat:
+        @"[REQUEST] %@ %@\nHeaders: %@\nBody: %@",
+        method, url, request.allHTTPHeaderFields, reqBody]);
+
     if (!completionHandler) return %orig;
 
     void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) =
-        ^(NSData *data, NSURLResponse *response, NSError *error) {
-            NSData *patchedData = data;
-            if (data && !error) {
-                NSError *jsonError = nil;
-                id obj = [NSJSONSerialization JSONObjectWithData:data
-                                                        options:NSJSONReadingMutableContainers
-                                                          error:&jsonError];
-                if (obj && !jsonError) {
-                    id patched = patchJSON(obj);
-                    NSData *reencoded = [NSJSONSerialization dataWithJSONObject:patched
-                                                                        options:0
-                                                                          error:nil];
-                    if (reencoded) patchedData = reencoded;
-                }
+        ^(NSData *responseData, NSURLResponse *response, NSError *error) {
+            NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
+            NSString *body = @"(none)";
+            if (responseData) {
+                body = [[NSString alloc] initWithData:responseData encoding:NSUTF8StringEncoding] ?: @"(binary)";
             }
-            completionHandler(patchedData, response, error);
+            dumpToFile([NSString stringWithFormat:
+                @"[RESPONSE] %@ -> HTTP %ld\nBody: %@",
+                url, (long)http.statusCode, body]);
+
+            if (error) {
+                dumpToFile([NSString stringWithFormat:@"[ERROR] %@: %@", url, error.localizedDescription]);
+            }
+
+            completionHandler(responseData, response, error);
         };
 
     return %orig(request, wrappedHandler);
@@ -76,56 +60,60 @@ static id patchJSON(id obj) {
 %end
 
 
-// ── WKWebView JS bridge — intercept getIsSubscribed replies ──────────────────
-// When the JS layer asks Swift "are you subscribed?", Swift calls
-// evaluateJavaScript to post the reply back. We intercept outgoing JS
-// calls and inject isSubscribed=true into any reply payload.
+// ── WKWebView — log all JS evaluated and all messages posted to Swift ─────────
 
 %hook WKWebView
 
 - (void)evaluateJavaScript:(NSString *)js completionHandler:(void (^)(id, NSError *))completion {
-    // The SDK bridge posts replies as JSON strings — patch them on the fly
-    if ([js containsString:@"isSubscribed"] || [js containsString:@"isPremium"]) {
-        // Replace false with true in the JS string being evaluated
-        NSString *patched = [js stringByReplacingOccurrencesOfString:@"\"isSubscribed\":false"
-                                                          withString:@"\"isSubscribed\":true"];
-        patched = [patched stringByReplacingOccurrencesOfString:@"\"isPremium\":false"
-                                                     withString:@"\"isPremium\":true"];
-        patched = [patched stringByReplacingOccurrencesOfString:@"\\\"isSubscribed\\\":false"
-                                                     withString:@"\\\"isSubscribed\\\":true"];
-        patched = [patched stringByReplacingOccurrencesOfString:@"\\\"isPremium\\\":false"
-                                                     withString:@"\\\"isPremium\\\":true"];
-        %orig(patched, completion);
-        return;
-    }
+    dumpToFile([NSString stringWithFormat:@"[JS->WEB] %@", js]);
     %orig;
 }
 
 %end
 
 
-// ── NSUserDefaults — catch any locally cached subscription state ──────────────
+// ── WKScriptMessageHandler — log messages coming FROM the WebView TO Swift ────
+
+@interface WKScriptMessage : NSObject
+@property (nonatomic, readonly, copy) NSString *name;
+@property (nonatomic, readonly, copy) id body;
+@end
+
+%hook NSObject
+
+- (void)userContentController:(WKUserContentController *)controller
+      didReceiveScriptMessage:(WKScriptMessage *)message {
+    dumpToFile([NSString stringWithFormat:
+        @"[WEB->SWIFT] name=%@ body=%@", message.name, message.body]);
+    %orig;
+}
+
+%end
+
+
+// ── NSUserDefaults — log all reads/writes ────────────────────────────────────
 
 %hook NSUserDefaults
 
+- (void)setBool:(BOOL)value forKey:(NSString *)key {
+    dumpToFile([NSString stringWithFormat:@"[DEFAULTS SET BOOL] %@ = %@", key, value ? @"YES" : @"NO"]);
+    %orig;
+}
+
+- (void)setObject:(id)value forKey:(NSString *)key {
+    dumpToFile([NSString stringWithFormat:@"[DEFAULTS SET] %@ = %@", key, value]);
+    %orig;
+}
+
 - (BOOL)boolForKey:(NSString *)key {
-    if ([key containsString:@"subscri"] || [key containsString:@"Subscri"] ||
-        [key containsString:@"premium"] || [key containsString:@"Premium"] ||
-        [key containsString:@"isSubscribed"] || [key containsString:@"IsSubscribed"]) {
-        return YES;
-    }
-    return %orig;
+    BOOL val = %orig;
+    dumpToFile([NSString stringWithFormat:@"[DEFAULTS GET BOOL] %@ = %@", key, val ? @"YES" : @"NO"]);
+    return val;
 }
 
 - (id)objectForKey:(NSString *)key {
     id val = %orig;
-    // If it's a stored bool/number for subscription, override
-    if ([key containsString:@"subscri"] || [key containsString:@"Subscri"] ||
-        [key containsString:@"premium"] || [key containsString:@"Premium"]) {
-        if (!val || [val isKindOfClass:[NSNumber class]]) {
-            return @YES;
-        }
-    }
+    dumpToFile([NSString stringWithFormat:@"[DEFAULTS GET] %@ = %@", key, val]);
     return val;
 }
 
