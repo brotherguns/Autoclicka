@@ -1,12 +1,18 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <WebKit/WebKit.h>
+#import <StoreKit/StoreKit.h>
 
-// ── Logger ───────────────────────────────────────────────────────────────────
+// ── Logger — saves to app's own Documents (visible in Files app) ──────────────
+
+static NSString *logPath() {
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    return [paths[0] stringByAppendingPathComponent:@"unlockr_dump.txt"];
+}
 
 static void dumpToFile(NSString *entry) {
-    NSString *path = @"/var/mobile/Documents/unlockr_dump.txt";
     NSString *line = [NSString stringWithFormat:@"%@\n---\n", entry];
+    NSString *path = logPath();
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
     if (!fh) {
         [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -60,7 +66,7 @@ static void dumpToFile(NSString *entry) {
 %end
 
 
-// ── WKWebView — log all JS evaluated and all messages posted to Swift ─────────
+// ── WKWebView — log JS evaluated and intercept restore button ─────────────────
 
 %hook WKWebView
 
@@ -72,7 +78,7 @@ static void dumpToFile(NSString *entry) {
 %end
 
 
-// ── WKScriptMessageHandler — log messages coming FROM the WebView TO Swift ────
+// ── JS->Swift bridge — log all messages from the WebView ─────────────────────
 
 %hook NSObject
 
@@ -80,6 +86,51 @@ static void dumpToFile(NSString *entry) {
       didReceiveScriptMessage:(WKScriptMessage *)message {
     dumpToFile([NSString stringWithFormat:
         @"[WEB->SWIFT] name=%@ body=%@", message.name, message.body]);
+    %orig;
+}
+
+%end
+
+
+// ── SKPaymentQueue — log restore calls and fake success ───────────────────────
+
+%hook SKPaymentQueue
+
+- (void)restoreCompletedTransactions {
+    dumpToFile(@"[STOREKIT] restoreCompletedTransactions called");
+    %orig;
+}
+
+- (void)restoreCompletedTransactionsWithApplicationUsername:(NSString *)username {
+    dumpToFile([NSString stringWithFormat:@"[STOREKIT] restoreCompletedTransactionsWithApplicationUsername: %@", username]);
+    %orig;
+}
+
+%end
+
+
+// ── SKPaymentTransactionObserver — log all transaction updates ────────────────
+
+%hook NSObject
+
+- (void)paymentQueue:(SKPaymentQueue *)queue updatedTransactions:(NSArray *)transactions {
+    for (SKPaymentTransaction *tx in transactions) {
+        dumpToFile([NSString stringWithFormat:
+            @"[STOREKIT TX] productID=%@ state=%ld error=%@",
+            tx.payment.productIdentifier,
+            (long)tx.transactionState,
+            tx.error.localizedDescription ?: @"none"]);
+    }
+    %orig;
+}
+
+- (void)paymentQueue:(SKPaymentQueue *)queue restoreCompletedTransactionsFailedWithError:(NSError *)error {
+    dumpToFile([NSString stringWithFormat:@"[STOREKIT RESTORE FAILED] %@", error]);
+    %orig;
+}
+
+- (void)paymentQueueRestoreCompletedTransactionsFinished:(SKPaymentQueue *)queue {
+    dumpToFile(@"[STOREKIT RESTORE FINISHED]");
     %orig;
 }
 
