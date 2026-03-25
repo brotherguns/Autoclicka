@@ -47,15 +47,13 @@
 }
 
 - (void)getCurrencyWithCompletion:(void (^)(TJCurrency *, NSError *))completion {
-    // Let the real call run so the SDK stays happy, but wrap the callback
-    %orig(^(TJCurrency *currency, NSError *error) {
-        // Force the balance before handing it to the app
+    void (^wrappedCompletion)(TJCurrency *, NSError *) = ^(TJCurrency *currency, NSError *error) {
         if (currency) {
-            // Use KVC to bypass any readonly enforcement
             [currency setValue:@(SPOOF_CREDITS) forKey:@"balance"];
         }
         if (completion) completion(currency, error);
-    });
+    };
+    %orig(wrappedCompletion);
 }
 
 %end
