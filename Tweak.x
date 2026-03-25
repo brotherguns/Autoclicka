@@ -1,59 +1,57 @@
 #import <UIKit/UIKit.h>
+#import <Foundation/Foundation.h>
 
-// How many credits to spoof
 #define SPOOF_CREDITS 99999
 
-// ── TJCurrency ───────────────────────────────────────────────────────────────
-// Each currency object has a `balance` property. Spoofing here covers
-// any codepath that reads balance off the object directly.
-
-@interface TJCurrency : NSObject
-@property (nonatomic, assign) NSInteger balance;
-@property (nonatomic, assign) NSInteger lastBalanceChange;
-@end
-
-%hook TJCurrency
-
-- (NSInteger)balance {
-    return SPOOF_CREDITS;
+// Recursively patch any dict/array coming out of JSON that has a "credits" key
+static id patchCredits(id obj) {
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *d = [((NSDictionary *)obj) mutableCopy];
+        if (d[@"credits"] != nil) {
+            d[@"credits"] = @(SPOOF_CREDITS);
+        }
+        for (NSString *key in [d allKeys]) {
+            d[key] = patchCredits(d[key]);
+        }
+        return [d copy];
+    } else if ([obj isKindOfClass:[NSArray class]]) {
+        NSMutableArray *a = [((NSArray *)obj) mutableCopy];
+        for (NSUInteger i = 0; i < a.count; i++) {
+            a[i] = patchCredits(a[i]);
+        }
+        return [a copy];
+    }
+    return obj;
 }
 
-- (NSInteger)lastBalanceChange {
-    return 0;
+%hook NSJSONSerialization
+
++ (id)JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError **)error {
+    id result = %orig(data, opt, error);
+    if (result) {
+        result = patchCredits(result);
+    }
+    return result;
 }
 
 %end
 
 
-// ── TJCCurrencyManager ───────────────────────────────────────────────────────
-// getCurrencyBalance is the sync getter the app polls.
-// getCurrencyWithCompletion: is the async server fetch — we let it run but
-// swap the balance on the returned TJCurrency before the app sees it.
+// Keep Tapjoy hooks for the credit meter display
+@interface TJCurrency : NSObject
+@property (nonatomic, assign) NSInteger balance;
+@end
 
 @interface TJCCurrencyManager : NSObject
 - (NSInteger)getCurrencyBalance;
 - (NSInteger)getBalanceForCurrencyId:(NSString *)currencyId;
-- (void)getCurrencyWithCompletion:(void (^)(TJCurrency *, NSError *))completion;
 @end
 
+%hook TJCurrency
+- (NSInteger)balance { return SPOOF_CREDITS; }
+%end
+
 %hook TJCCurrencyManager
-
-- (NSInteger)getCurrencyBalance {
-    return SPOOF_CREDITS;
-}
-
-- (NSInteger)getBalanceForCurrencyId:(NSString *)currencyId {
-    return SPOOF_CREDITS;
-}
-
-- (void)getCurrencyWithCompletion:(void (^)(TJCurrency *, NSError *))completion {
-    void (^wrappedCompletion)(TJCurrency *, NSError *) = ^(TJCurrency *currency, NSError *error) {
-        if (currency) {
-            [currency setValue:@(SPOOF_CREDITS) forKey:@"balance"];
-        }
-        if (completion) completion(currency, error);
-    };
-    %orig(wrappedCompletion);
-}
-
+- (NSInteger)getCurrencyBalance { return SPOOF_CREDITS; }
+- (NSInteger)getBalanceForCurrencyId:(NSString *)currencyId { return SPOOF_CREDITS; }
 %end
