@@ -1,8 +1,7 @@
-Package: com.borthergusnd.universalautoclicker
-Name: Universal Auto Clicker
+Package: com.yourname.unlockrcredits
+Name: UnlockrCredits
 Version: 1.0.0
 Architecture: iphoneos-arm64
-Description: Floating autoclicker - single point and sequence modes
-Maintainer: borthergusnd
-Author: borthergusnd
+Description: Spoofs Tapjoy credit balance in Unlock-r
+Author: You
 Section: Tweaks

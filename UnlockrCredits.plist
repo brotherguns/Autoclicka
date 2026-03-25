@@ -1,0 +1,5 @@
+{
+    Filter = {
+        Bundles = ( "com.algorythmtech.unlock-r" );
+    };
+}
